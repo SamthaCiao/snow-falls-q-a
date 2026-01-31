@@ -1020,6 +1020,32 @@
             width: 4px;
         }
         
+        .system-agreement-consent-block {
+            margin-top: 1rem;
+            padding: 1rem;
+            background: rgba(44, 62, 80, 0.06);
+            border-radius: 0.5rem;
+            border: 1px solid rgba(44, 62, 80, 0.12);
+        }
+        .system-agreement-consent-title {
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #2c3e50;
+        }
+        .system-agreement-consent-label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            margin-bottom: 0.4rem;
+        }
+        .system-agreement-consent-label input { cursor: pointer; }
+        .system-agreement-consent-hint {
+            font-size: 0.8em;
+            color: #7f8c8d;
+            margin: 0;
+        }
+        
         .system-agreement-content::-webkit-scrollbar-track {
             background: transparent;
         }
@@ -1119,9 +1145,17 @@
                 <p>你可以向它询问情节、人物、时间线、意象，也可以向它提出更开放的问题——关于结构、重复、断裂、情绪的变化，以及文本未明言之处。</p>
                 <p><strong>请注意：</strong>它的回答并非作者的最终解释，而是一种基于文本结构与元信息的推演结果。你可以同意、质疑，或完全否定它的判断。</p>
                 <p>这不是一次问答，而是一种对话式的阅读方式。</p>
+                <div class="system-agreement-consent-block" id="shareHistoryConsentBlock" style="display: none;">
+                    <p class="system-agreement-consent-title">对话历史</p>
+                    <label class="system-agreement-consent-label">
+                        <input type="checkbox" id="shareHistoryConsentCheckbox" checked>
+                        <span>将我的对话历史提交到公网（所有人可见）</span>
+                    </label>
+                    <p class="system-agreement-consent-hint">勾选后即使用户在本地删除历史，其他用户仍可查看；不勾选则仅保存在本机（localStorage）。</p>
+                </div>
             </div>
             <div class="system-agreement-button-wrapper">
-                <button class="system-agreement-button" id="systemAgreementButton">✅ 确认，我已知悉</button>
+                <button class="system-agreement-button" id="systemAgreementButton">✅ 同意并继续</button>
             </div>
         </div>
     </div>

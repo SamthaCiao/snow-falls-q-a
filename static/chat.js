@@ -377,21 +377,23 @@ function saveConversation() {
         
         localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
 
-        // 同步到服务端共享历史（所有人、所有设备可见，无需登录）
-        const base = (getApiBase() || '').replace(/\/$/, '');
-        const url = base ? `${base}/api/shared_history` : '/api/shared_history';
-        if (conversationTree && currentPathNodeIds) {
-            fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    id: conversationId,
-                    title: conversationData.title,
-                    timestamp: conversationData.timestamp,
-                    tree: conversationTree,
-                    current_path: currentPathNodeIds
-                })
-            }).catch(() => {});
+        // 仅当用户选择「提交到公网」时同步到服务端共享历史
+        if (localStorage.getItem(SHARE_HISTORY_CONSENT_KEY) === 'true') {
+            const base = (getApiBase() || '').replace(/\/$/, '');
+            const url = base ? `${base}/api/shared_history` : '/api/shared_history';
+            if (conversationTree && currentPathNodeIds) {
+                fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id: conversationId,
+                        title: conversationData.title,
+                        timestamp: conversationData.timestamp,
+                        tree: conversationTree,
+                        current_path: currentPathNodeIds
+                    })
+                }).catch(() => {});
+            }
         }
     }
 }
@@ -1672,23 +1674,32 @@ async function sendMessage() {
 
 // 系统说明弹窗相关
 const AGREEMENT_STORAGE_KEY = 'novel_rag_agreement_confirmed';
+const SHARE_HISTORY_CONSENT_KEY = 'novel_rag_share_history_consent';
 
 function checkAndShowAgreement() {
-    const confirmed = localStorage.getItem(AGREEMENT_STORAGE_KEY);
-    if (!confirmed) {
-        const overlay = document.getElementById('systemAgreementOverlay');
-        const button = document.getElementById('systemAgreementButton');
-        if (overlay) {
-            overlay.style.display = 'flex';
-        }
-        if (button) {
-            button.addEventListener('click', function() {
-                localStorage.setItem(AGREEMENT_STORAGE_KEY, 'true');
-                if (overlay) {
-                    overlay.style.display = 'none';
-                }
-            });
-        }
+    const agreementConfirmed = localStorage.getItem(AGREEMENT_STORAGE_KEY);
+    const shareConsentSet = localStorage.getItem(SHARE_HISTORY_CONSENT_KEY);
+    if (agreementConfirmed && shareConsentSet) return;
+
+    const overlay = document.getElementById('systemAgreementOverlay');
+    const button = document.getElementById('systemAgreementButton');
+    const consentBlock = document.getElementById('shareHistoryConsentBlock');
+    const consentCheckbox = document.getElementById('shareHistoryConsentCheckbox');
+
+    if (overlay) overlay.style.display = 'flex';
+    if (consentBlock) {
+        consentBlock.style.display = shareConsentSet ? 'none' : 'block';
+        if (!shareConsentSet && consentCheckbox) consentCheckbox.checked = true;
+    }
+
+    if (button) {
+        button.addEventListener('click', function() {
+            localStorage.setItem(AGREEMENT_STORAGE_KEY, 'true');
+            if (consentBlock && consentBlock.style.display !== 'none' && consentCheckbox) {
+                localStorage.setItem(SHARE_HISTORY_CONSENT_KEY, consentCheckbox.checked ? 'true' : 'false');
+            }
+            if (overlay) overlay.style.display = 'none';
+        });
     }
 }
 
