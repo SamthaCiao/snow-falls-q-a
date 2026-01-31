@@ -1,0 +1,14 @@
+# 构建镜像时不复制敏感内容；数据源用 数据源.pack.zip，chroma_db 随仓库复制
+.env
+SUPER_MIND_API_KEY.env
+数据源
+
+# 测试与缓存
+test
+.pytest_cache
+__pycache__
+*.pyc
+.git
+.gitignore
+*.md
+!README.md

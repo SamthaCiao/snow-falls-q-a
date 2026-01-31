@@ -1,0 +1,38 @@
+# 环境与密钥（切勿提交到公开仓库）
+.env
+SUPER_MIND_API_KEY.env
+*.env
+!.env.example
+
+# 数据源目录（不提交；使用 数据源.pack.zip 或本地 数据源/）
+数据源/
+# chroma_db 已允许提交，便于部署时随仓库使用
+# 仅维护者本地保留，clone 者无原文无法重建索引
+rebuild_index.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

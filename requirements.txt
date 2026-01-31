@@ -1,0 +1,25 @@
+# 核心 RAG（向量化使用千帆 API，无本地 embedding）
+chromadb>=0.4.0
+numpy>=1.20.0
+
+# 可选：BM25、中文分词
+rank-bm25>=0.2.2
+jieba>=0.42.1
+
+# 可选：LangChain 分块（已有 fallback）
+langchain-text-splitters>=0.2.0
+langchain-core>=0.2.0
+
+# 编排与可观测（本方案新增）
+langchain-openai>=0.1.0
+
+# LLM 与 API
+openai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.28.0
+
+# Web
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+
