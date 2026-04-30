@@ -1698,6 +1698,127 @@ class NovelRAGSystem:
                     "请关闭应用后运行 rebuild_index.py 重建索引。"
                 ) from e
             raise
+
+    def search_multi(
+        self,
+        queries: List[str],
+        entities: Optional[List[str]] = None,
+        target_source: Optional[str] = None,
+        top_k_per_query: int = 3,
+        top_k_final: int = 10,
+        use_background: bool = True,
+        use_hybrid: bool = True,
+    ) -> Dict:
+        """
+        多 query 混合检索：对 queries 逐条检索（每条 top_k 更小），再合并去重重排。
+
+        - 去重键：以 content 为主（与现有 _merge_and_rerank 对齐）
+        - 实体强制拼回：调用方应在生成 queries 时拼回；这里也会做一次轻量补偿（只影响 rerank，不改写 query）
+        """
+        queries = [q.strip() for q in (queries or []) if isinstance(q, str) and q.strip()]
+        if not queries:
+            return self.search(
+                query="",
+                target_source=target_source,
+                top_k=top_k_final,
+                use_background=use_background,
+                use_hybrid=use_hybrid,
+            )
+
+        entities = [e.strip() for e in (entities or []) if isinstance(e, str) and e.strip()]
+
+        all_results: List[Dict[str, Any]] = []
+        # 逐条检索（串行，便于日志与稳定性；需要可再并行化）
+        for q in queries:
+            r = self.search(
+                query=q,
+                target_source=target_source,
+                top_k=max(1, int(top_k_per_query)),
+                use_background=use_background,
+                use_hybrid=use_hybrid,
+            )
+            all_results.append(r)
+
+        # 统一目标来源（优先取第一条 query 的判定）
+        final_target = all_results[0].get("target_source") if all_results else (target_source or "雪落成诗")
+
+        def _flatten_one(sr: Dict[str, Any]) -> List[Dict[str, Any]]:
+            if sr.get("target_source") == "影化成殇":
+                primary = sr.get("sequel_results", []) or []
+                bg = sr.get("background_results", []) or []
+            else:
+                primary = sr.get("main_results", []) or []
+                bg = sr.get("background_results", []) or []
+            out = []
+            for item in (primary + bg):
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content") or ""
+                if not content:
+                    continue
+                out.append(item)
+            return out
+
+        flat: List[Dict[str, Any]] = []
+        for sr in all_results:
+            flat.extend(_flatten_one(sr))
+
+        # 合并去重：content 为主键，保留最高 combined_score（若无则用向量相似度估算）
+        merged: Dict[str, Dict[str, Any]] = {}
+        for item in flat:
+            content = item.get("content")
+            if not content:
+                continue
+            combined = item.get("combined_score")
+            if combined is None:
+                # 兼容向量结果：distance 越小越好
+                dist = item.get("distance")
+                if dist is None:
+                    combined = 0.0
+                else:
+                    try:
+                        combined = float(1.0 - float(dist))
+                    except Exception:
+                        combined = 0.0
+            else:
+                try:
+                    combined = float(combined)
+                except Exception:
+                    combined = 0.0
+
+            if content not in merged or combined > float(merged[content].get("combined_score", 0.0) or 0.0):
+                merged[content] = {**item, "combined_score": combined}
+
+        merged_list = list(merged.values())
+
+        # 轻量实体加权：如果内容命中实体，稍微加分（不破坏原排序太多）
+        if entities:
+            for r in merged_list:
+                bonus = 0.0
+                c = r.get("content", "")
+                for e in entities[:5]:
+                    if e and e in c:
+                        bonus += 0.03
+                r["combined_score"] = float(r.get("combined_score", 0.0) or 0.0) + bonus
+
+        merged_list.sort(key=lambda x: float(x.get("combined_score", 0.0) or 0.0), reverse=True)
+        merged_list = merged_list[: max(1, int(top_k_final))]
+
+        # 输出结构与 search 对齐：仅填充对应 target_source 的 primary results
+        out = {
+            "query": " | ".join(queries[:4]),
+            "queries": queries,
+            "entities": entities,
+            "target_source": final_target,
+            "main_results": [],
+            "sequel_results": [],
+            "background_results": [],
+        }
+        if final_target == "影化成殇":
+            out["sequel_results"] = merged_list
+        else:
+            out["main_results"] = merged_list
+        return out
     
     def _merge_and_rerank(self, vector_results: List[Dict], bm25_results: List[Dict], query: str) -> List[Dict]:
         """

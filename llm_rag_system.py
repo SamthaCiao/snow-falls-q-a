@@ -8,6 +8,7 @@ import json
 import logging
 import requests
 import time
+import re
 from typing import List, Dict, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -821,6 +822,468 @@ class LLMRAGSystem:
             logger.error(f"查询改写失败: {e}，使用原始查询")
             return user_query
 
+    def _translate_to_zh_simple(self, text: str) -> str:
+        """
+        极简翻译：仅在 en/mixed 时使用，将问题翻译成中文，方便中文检索。
+        不走结构化 JSON，避免模型不稳定导致解析失败。
+        """
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个翻译助手。请把用户输入翻译成自然、准确的中文。只返回译文，不要解释。"},
+                    {"role": "user", "content": text.strip()},
+                ],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            return out if out else text
+        except Exception as e:
+            logger.warning(f"翻译失败，使用原文: {e}")
+            return text
+
+    def _finalize_rewrite_as_keywords(
+        self,
+        text: str,
+        fallback_text: str = "",
+        entities: Optional[List[str]] = None,
+        original_raw: str = "",
+        allowed_english: Optional[List[str]] = None,
+    ) -> str:
+        """
+        最终兜底校验：把改写结果压成“空格分词的关键词串”。
+        - 去掉引号/分号/多余标点
+        - 只保留：中文词(>=2) + 英文单词 + 实体（别名映射到主名）
+        """
+        base = text or ""
+        base = base.replace("；", " ").replace(";", " ").replace("“", " ").replace("”", " ").replace('"', " ").replace("'", " ")
+        base = re.sub(r"\s+", " ", base).strip()
+
+        # 先尝试用 rag_system 的关键词抽取（已有停用词/同义词/别名扩展）
+        kws: List[str] = []
+        try:
+            if hasattr(self, "rag_system") and hasattr(self.rag_system, "_extract_keywords"):
+                kws = self.rag_system._extract_keywords(base)  # type: ignore
+        except Exception:
+            kws = []
+
+        # 再补充：纯规则抽取（避免 _extract_keywords 覆盖不到的新词）
+        if not kws:
+            cleaned = re.sub(r"[^\w\u4e00-\u9fff\s]", " ", base)
+            zh = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
+            en = re.findall(r"[A-Za-z]{2,}", cleaned)
+            kws = zh + [w.lower() for w in en]
+
+        # 实体：别名 -> 主名
+        ent_list = self._map_entities_aliases(list(entities or []))
+        # 如果用户问句/译文里包含别名，也做一次映射补齐
+        try:
+            alias_to_main = self._build_alias_to_main_map()
+            for token in re.findall(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}", (fallback_text or "") + " " + base):
+                mapped = alias_to_main.get(token.lower())
+                if mapped and mapped not in ent_list:
+                    ent_list.append(mapped)
+        except Exception:
+            pass
+
+        # 合并：实体优先
+        merged: List[str] = []
+        for e in ent_list:
+            if e and e not in merged:
+                merged.append(e)
+        for k in kws:
+            kk = (k or "").strip()
+            if not kk:
+                continue
+            # 过滤明显无用的超长句子/噪声
+            if len(kk) > 24 and re.search(r"[\u4e00-\u9fff]", kk):
+                continue
+            if kk not in merged:
+                merged.append(kk)
+
+        # 英文 token 最终校验：禁止“新生成英文词”
+        # 规则：只有当英文在用户原始输入中出现过，且能命中续集判定关键词表（即 steven/samantha）才允许保留。
+        allow_set = set([s.lower() for s in (allowed_english or []) if isinstance(s, str) and s.strip()])
+        if allow_set:
+            filtered: List[str] = []
+            for t in merged:
+                if not isinstance(t, str):
+                    continue
+                if re.fullmatch(r"[A-Za-z]{2,}", t):
+                    if t.lower() not in allow_set:
+                        continue
+                filtered.append(t)
+            merged = filtered
+        else:
+            # 默认：不保留任何英文 token（包括 xiakongshan/steven 等），避免误路由与中文检索噪声
+            merged = [t for t in merged if not (isinstance(t, str) and re.fullmatch(r"[A-Za-z]{2,}", t))]
+
+        # 最终兜底：如果仍为空，用 fallback_text 做中文规则抽取
+        if not merged and fallback_text:
+            merged = self._extract_keywords_rule_zh(fallback_text, entities=ent_list)
+
+        # 控制长度，输出空格分词（适配 BM25/jieba/向量检索）
+        merged = merged[:10]
+        return " ".join(merged).strip() if merged else (fallback_text or base or "").strip()
+
+    def _rewrite_keywords_one_shot(self, raw_query: str) -> str:
+        """
+        降本版：一次 LLM 调用同时完成（必要时翻译为中文 + 改写为检索关键词串）。
+        输出要求：只输出空格分词的关键词串，不要句子、不要标点、不要解释。
+        """
+        raw = (raw_query or "").strip()
+        if not raw:
+            return raw
+        system_prompt = """你是“中文检索关键词改写器”。
+你的任务：把用户问题改写成适合中文语料检索的关键词串（用空格分词）。
+
+硬性要求：
+1) 只输出关键词串（空格分隔），不要句子、不要标点、不要换行、不要解释。
+2) 如果输入是英文或中英混合，先在脑中翻译成中文再提取关键词；输出尽量用中文关键词。
+3) 人名/别名/拼音/ID 若能映射到中文主名则输出中文主名（例如 xiakongshan -> 夏空山）。
+4) 不要输出任何“新生成的英文词”。英文词只有在用户原始输入里出现过且明确需要时才可保留，否则一律不要输出英文。
+
+示例输出格式（仅格式示例，不要照抄内容）：
+夏空山 学术竞赛 主题 科目
+"""
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": raw},
+                ],
+                temperature=0.2,
+                max_tokens=120,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            return out
+        except Exception as e:
+            logger.warning(f"one-shot 改写失败，回退到旧逻辑: {e}")
+            return ""
+
+    def _rewrite_query_safe(self, user_query: str) -> str:
+        """
+        推荐检索 query 生成：不返回结构化 dict，只返回“关键词串”（空格分词）。
+        用于所有下游只能接受字符串的模块，避免整句噪声影响 BM25/jieba 与中文向量检索。
+        """
+        raw = (user_query or "").strip()
+        if not raw:
+            return raw
+
+        # 续集判定英文关键词（与 rag_system.search 的启发式一致）
+        sequel_en_keywords = {"steven", "samantha"}
+        raw_en_tokens = set([w.lower() for w in re.findall(r"[A-Za-z]{2,}", raw)])
+        allowed_english = list(raw_en_tokens & sequel_en_keywords)
+
+        # 降本：一次调用完成翻译+关键词化；失败再回退到旧两步逻辑
+        rewritten = self._rewrite_keywords_one_shot(raw)
+        if not rewritten:
+            lang = self._detect_lang_simple(raw)
+            zh_text = raw
+            if lang in ("en", "mixed"):
+                zh_text = self._translate_to_zh_simple(raw)
+            rewritten = self._rewrite_query(zh_text)
+        else:
+            zh_text = raw  # one-shot 内部已处理翻译，这里只做兜底映射与规则抽取
+
+        # 轻量规则补词：提升“主题/科目/学科/题目”等证据句的召回稳定性
+        # 只加中文，不生成新英文 token；优先用原始英文 cue 触发（避免中文问句被过度扩展）
+        raw_lower = raw.lower()
+        extra_zh: List[str] = []
+        if any(k in raw_lower for k in ["subject", "theme", "topic"]):
+            extra_zh.extend(["科目", "学科", "题目", "主题"])
+        if "competition" in raw_lower or "contest" in raw_lower:
+            extra_zh.extend(["竞赛", "比赛"])
+        if "academic" in raw_lower:
+            extra_zh.extend(["学术"])
+        # 去重并拼回 rewritten，让 finalize 统一清洗/限长
+        if extra_zh:
+            dedup_extra = []
+            for t in extra_zh:
+                if t not in dedup_extra:
+                    dedup_extra.append(t)
+            rewritten = (rewritten + " " + " ".join(dedup_extra)).strip()
+
+        # 尝试从人物画像做实体补齐（用原问句 + 中文化问句）
+        entities: List[str] = []
+        try:
+            if getattr(self.rag_system, "character_profiles", None):
+                char_results = self.rag_system.search_characters(raw, top_k=5)
+                for r in (char_results or [])[:2]:
+                    nm = r.get("character")
+                    if nm and nm not in entities:
+                        entities.append(nm)
+        except Exception:
+            pass
+
+        final_q = self._finalize_rewrite_as_keywords(
+            rewritten,
+            fallback_text=zh_text,
+            entities=entities,
+            original_raw=raw,
+            allowed_english=allowed_english,
+        )
+        logger.info(f"[rewrite_safe] {user_query} -> {final_q}")
+        return final_q
+
+    def _build_multi_query_variants(self, raw_query: str, keyword_query: str) -> List[str]:
+        """
+        多 query 变体（纯字符串）：
+        - 用于缓解英文歧义/同义表达差异（subject/theme/topic → 科目/学科/题目/主题）
+        - 每条仍是“空格分词关键词串”，不会下传 dict
+        """
+        base = (keyword_query or "").strip()
+        if not base:
+            return []
+
+        tokens = [t for t in base.split() if t]
+        token_set = set(tokens)
+
+        # topic/subject 同义扩展（只对包含相关英文 cue 的情况更积极）
+        raw_lower = (raw_query or "").lower()
+        need_topic = any(k in raw_lower for k in ["subject", "theme", "topic"]) or any(t in token_set for t in ["主题", "题目", "科目", "学科"])
+        topic_syn = ["科目", "学科", "题目", "主题"] if need_topic else []
+
+        variants: List[str] = []
+
+        # v0: base
+        variants.append(base)
+
+        # v1-v3: base + 单个同义词（避免过长；让 BM25 更容易命中不同表述）
+        for syn in topic_syn:
+            if syn not in token_set:
+                q = (base + " " + syn).strip()
+                variants.append(q)
+
+        # 去重+限条数
+        dedup: List[str] = []
+        for q in variants:
+            qq = " ".join(q.split()).strip()
+            if qq and qq not in dedup:
+                dedup.append(qq)
+        return dedup[:4]
+
+    def _detect_lang_simple(self, text: str) -> str:
+        """
+        粗语言检测：zh / en / mixed（足够用于分流翻译与关键词策略）。
+        """
+        if not text:
+            return "zh"
+        has_zh = bool(re.search(r"[\u4e00-\u9fff]", text))
+        has_en = bool(re.search(r"[A-Za-z]", text))
+        if has_zh and has_en:
+            return "mixed"
+        if has_zh:
+            return "zh"
+        if has_en:
+            return "en"
+        return "zh"
+
+    def _build_alias_to_main_map(self) -> Dict[str, str]:
+        """
+        从人物画像库构建别名 -> 主名映射（小写 key，便于 case-insensitive）。
+        """
+        alias_to_main: Dict[str, str] = {}
+        try:
+            profiles = getattr(self.rag_system, "character_profiles", {}) or {}
+            for main_name, profile in profiles.items():
+                if not main_name:
+                    continue
+                aliases = (profile or {}).get("aliases", []) or []
+                for a in aliases:
+                    if not a:
+                        continue
+                    alias_to_main[a.strip().lower()] = main_name.strip()
+                alias_to_main[main_name.strip().lower()] = main_name.strip()
+        except Exception:
+            return {}
+        return alias_to_main
+
+    def _map_entities_aliases(self, entities: List[str]) -> List[str]:
+        alias_to_main = self._build_alias_to_main_map()
+        out: List[str] = []
+        for e in (entities or []):
+            if not isinstance(e, str):
+                continue
+            s = e.strip()
+            if not s:
+                continue
+            mapped = alias_to_main.get(s.lower(), s)
+            if mapped and mapped not in out:
+                out.append(mapped)
+        return out
+
+    def _extract_keywords_rule_zh(self, text_zh: str, entities: Optional[List[str]] = None) -> List[str]:
+        """
+        规则兜底：从中文文本里抽取可检索关键词（尽量短、去标点、去停用）。
+        """
+        if not text_zh:
+            return entities or []
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff\s]", " ", text_zh)
+        words = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
+        stop = {
+            "什么", "怎么", "为什么", "哪里", "是谁", "多少", "如何", "这个", "那个", "请问",
+            "一下", "能否", "可以", "帮我", "告诉", "解释", "分析", "以及", "还是", "但是",
+            "有没有", "是否", "关于", "相关", "内容", "问题", "小说", "这本", "里面",
+        }
+        kws: List[str] = []
+        for w in words:
+            if w in stop:
+                continue
+            if w not in kws:
+                kws.append(w)
+        for e in (entities or []):
+            if e and e not in kws:
+                kws.insert(0, e)
+        return kws[:12]
+
+    def _ensure_entities_in_queries(self, queries: List[str], entities: List[str]) -> List[str]:
+        """
+        强制把 entities 拼回每条 query：即便模型漏了，也由代码补齐。
+        """
+        entities = [e.strip() for e in (entities or []) if isinstance(e, str) and e.strip()]
+        if not entities:
+            return [q.strip() for q in (queries or []) if isinstance(q, str) and q.strip()]
+        out: List[str] = []
+        for q in (queries or []):
+            if not isinstance(q, str):
+                continue
+            s = q.strip()
+            if not s:
+                continue
+            # 去掉明显会干扰中文检索的引号/分号等
+            s = s.replace('"', " ").replace("'", " ").replace(";", " ").replace("；", " ").strip()
+            missing = [e for e in entities if e not in s]
+            if missing:
+                s = " ".join(missing + [s])
+            out.append(re.sub(r"\s+", " ", s).strip())
+        # 去重，保持顺序
+        dedup: List[str] = []
+        for q in out:
+            if q not in dedup:
+                dedup.append(q)
+        return dedup
+
+    def _rewrite_query_structured(self, user_query: str) -> Dict[str, Any]:
+        """
+        结构化改写：强制输出 JSON（语言检测/翻译/实体/关键词/多条短 query）。
+        - en/mixed：先翻译成中文并产出中文关键词/中文 queries
+        - zh：沿用中文关键词改写逻辑
+        """
+        lang_hint = self._detect_lang_simple(user_query)
+        system_prompt = """你是“检索查询生成器”。你的任务是把用户问题转换成可用于中文语料检索的结构化 JSON。
+
+必须输出严格 JSON（不要 markdown、不要解释）。字段说明：
+- lang: "zh" | "en" | "mixed"
+- translated_zh: 若原问题为 en/mixed，给出忠实的中文翻译；若为 zh，直接给出等价中文表述（可轻微规范化）
+- entities: 需要检索的人物/地点/作品名等实体，尽量用中文主名；如果出现英文/拼音/别名，尽量映射到中文主名（不知道就保留原样）
+- keywords_zh: 适合检索的中文关键词（2-8 个），必须是“词/短语”，不要整句，不要标点
+- queries: 2-4 条“中文短 query”，每条 6-18 个字左右，主要由 entities + keywords_zh 组成；不要引号、不要分号、不要整句复述
+
+额外约束：
+- 如果问题包含英文名（如 Steven / Samantha / xiakongshan），要尽量在 entities 中给出中文主名（如 夏空山 / 雪遗诗）。
+- queries 里尽量把实体放在前面，关键词放在后面。
+"""
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"用户问题：{user_query}\n\n请输出 JSON："}
+                ],
+                temperature=0.2,
+                max_tokens=350,
+            )
+            raw = resp.choices[0].message.content.strip()
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning(f"结构化改写失败（将走规则兜底）: {e}")
+            data = {}
+
+        # 规范化与兜底
+        lang = (data.get("lang") or lang_hint or "zh").strip().lower()
+        if lang not in ("zh", "en", "mixed"):
+            lang = lang_hint
+
+        translated_zh = data.get("translated_zh")
+        if not isinstance(translated_zh, str) or not translated_zh.strip():
+            translated_zh = user_query.strip()
+
+        entities = data.get("entities") if isinstance(data.get("entities"), list) else []
+        entities = [e for e in entities if isinstance(e, str)]
+        entities = self._map_entities_aliases(entities)
+
+        keywords_zh = data.get("keywords_zh") if isinstance(data.get("keywords_zh"), list) else []
+        keywords_zh = [k.strip() for k in keywords_zh if isinstance(k, str) and k.strip()]
+        if not keywords_zh:
+            keywords_zh = self._extract_keywords_rule_zh(translated_zh, entities=entities)
+        else:
+            # 清理：去掉整句/标点倾向
+            cleaned = []
+            for k in keywords_zh:
+                kk = re.sub(r"[^\w\u4e00-\u9fff]", "", k)
+                if len(kk) >= 2 and kk not in cleaned:
+                    cleaned.append(kk)
+            keywords_zh = cleaned[:12]
+
+        queries = data.get("queries") if isinstance(data.get("queries"), list) else []
+        queries = [q for q in queries if isinstance(q, str)]
+
+        # 如果模型没给 queries，用规则合成 2-4 条
+        if not queries:
+            base_terms = []
+            for e in entities:
+                if e and e not in base_terms:
+                    base_terms.append(e)
+            for k in keywords_zh:
+                if k and k not in base_terms:
+                    base_terms.append(k)
+            base_terms = base_terms[:6]
+            # 生成一些组合变体（尽量短）
+            combos = []
+            if base_terms:
+                combos.append(" ".join(base_terms[:3]))
+                if len(base_terms) >= 4:
+                    combos.append(" ".join(base_terms[:4]))
+                if len(base_terms) >= 5:
+                    combos.append(" ".join([base_terms[0]] + base_terms[2:5]))
+                combos.append(" ".join(base_terms[:2]))
+            queries = [c for c in combos if c.strip()]
+
+        # 强制拼回实体，清理标点，并控制条数
+        queries = self._ensure_entities_in_queries(queries, entities)
+        if len(queries) > 4:
+            queries = queries[:4]
+        if len(queries) < 2 and translated_zh:
+            # 兜底再补一条：实体 + 关键词
+            extra = " ".join((entities + keywords_zh)[:4]).strip()
+            if extra and extra not in queries:
+                queries.append(extra)
+
+        return {
+            "lang": lang,
+            "translated_zh": translated_zh.strip(),
+            "entities": entities,
+            "keywords_zh": keywords_zh[:10],
+            "queries": queries[:4],
+        }
+
+    def _build_retrieval_query_payload(self, user_query: str) -> Dict[str, Any]:
+        """
+        把结构化改写结果转成检索侧可消费的 payload（给 ChapterRAGRetriever / rag_system.search_multi）。
+        """
+        structured = self._rewrite_query_structured(user_query)
+        entities = structured.get("entities") or []
+        queries = structured.get("queries") or []
+        return {
+            "queries": queries,
+            "entities": entities,
+            "top_k_per_query": 3,
+            "structured": structured,  # 方便日志/调试（不强依赖）
+        }
+
     def _normalize_and_trim_history(self, conversation_history: Optional[List[Dict]], max_messages: int = 20, max_chars: int = 6000, current_query: Optional[str] = None) -> List[Dict]:
         """
         智能上下文管理：规范化并裁剪对话历史，实现对话记忆摘要、动态上下文选择、查询相关历史筛选
@@ -1113,10 +1576,8 @@ class LLMRAGSystem:
             
             # 执行检索
             try:
-                # 对每个查询进行改写
-                rewritten_query = self._rewrite_query(enhanced_query)
-                
-                # 执行检索
+                # 安全改写：只产出关键词串（空格分词），适配所有下游只吃字符串的检索器
+                rewritten_query = self._rewrite_query_safe(enhanced_query)
                 step_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                 
                 step_context = step_result.get("context", "")
@@ -1253,10 +1714,7 @@ class LLMRAGSystem:
             
             # 执行检索
             try:
-                # 对每个查询进行改写
-                rewritten_query = self._rewrite_query(enhanced_query)
-                
-                # 执行检索
+                rewritten_query = self._rewrite_query_safe(enhanced_query)
                 step_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                 
                 step_context = step_result.get("context", "")
@@ -1349,7 +1807,7 @@ class LLMRAGSystem:
             "result": result
         }
     
-    def _retrieve_context(self, query: str, question_type: str = "chapter_rag", original_query: Optional[str] = None) -> Dict:
+    def _retrieve_context(self, query: Any, question_type: str = "chapter_rag", original_query: Optional[str] = None) -> Dict:
         """
         根据问题类型检索相关上下文（调用各个RAG模块）
         
@@ -1365,16 +1823,53 @@ class LLMRAGSystem:
         rag_start_time = time.time()
         logger.info("=" * 60)
         logger.info("开始RAG检索...")
-        logger.info(f"查询: {query}")
+        # 避免多 query/结构化 payload 日志过长
+        if isinstance(query, list):
+            logger.info(f"查询: [multi] queries={len(query)}")
+        elif isinstance(query, dict):
+            _qs = query.get("queries") if isinstance(query.get("queries"), list) else None
+            _ent = query.get("entities") if isinstance(query.get("entities"), list) else None
+            logger.info(f"查询: [multi] queries={len(_qs) if _qs else 0}, entities={_ent[:5] if _ent else []}")
+        else:
+            logger.info(f"查询: {query}")
         logger.info(f"问题类型: {question_type}")
         logger.info("=" * 60)
+
+        # ========== query 归一化 ==========
+        # - chapter_rag：优先使用多 queries payload（dict）以提升召回
+        # - 其他检索器：只接受 str，使用 translated_zh（或第一条短 query）作为 query_text
+        chapter_query: Any = query
+        query_text: str
+        if isinstance(query, list):
+            # 多 query：取第一条作为其他检索器的 query_text
+            first_q = ""
+            for item in query:
+                if isinstance(item, str) and item.strip():
+                    first_q = item.strip()
+                    break
+            query_text = first_q or str(original_query or "")
+        elif isinstance(query, dict):
+            structured = query.get("structured") if isinstance(query.get("structured"), dict) else {}
+            translated_zh = structured.get("translated_zh") if isinstance(structured.get("translated_zh"), str) else ""
+            qs = query.get("queries") if isinstance(query.get("queries"), list) else []
+            first_q = ""
+            for item in qs:
+                if isinstance(item, str) and item.strip():
+                    first_q = item.strip()
+                    break
+            query_text = (translated_zh or first_q or (original_query or "")).strip()
+            if not query_text:
+                query_text = str(original_query or "")
+        else:
+            query_text = str(query or "").strip()
         
         # ========== 判断是否需要动态摘要 ==========
         if self.dynamic_summary_generator:
-            use_dynamic_summary, dynamic_reason = self.dynamic_summary_generator.should_use(query, question_type)
+            # 动态摘要仅接受纯字符串 query（结构化 payload 需先归一化）
+            use_dynamic_summary, dynamic_reason = self.dynamic_summary_generator.should_use(query_text, question_type)
             if use_dynamic_summary:
                 logger.info(f"触发动态摘要流程: {dynamic_reason}")
-                result = self.dynamic_summary_generator.retrieve(query)
+                result = self.dynamic_summary_generator.retrieve(query_text)
                 if not result.get('fallback', True):
                     logger.info("动态摘要生成成功，使用动态摘要作为上下文")
                     return {
@@ -1392,7 +1887,7 @@ class LLMRAGSystem:
         character_context = ""
         character_sources = []
         is_character_related = False
-        character_query = (original_query or query).strip()
+        character_query = (original_query or query_text).strip()
         character_keywords = ["主角", "男女主角", "人物", "谁", "姓名", "角色", "男主", "女主"]
         is_likely_character_question = any(kw in character_query for kw in character_keywords)
         
@@ -1422,33 +1917,40 @@ class LLMRAGSystem:
             # 行为分析类问题使用行为分析模块（不走 LangChain 适配，保持原有逻辑）
             if question_type in ["behavior_explanation", "scenario_simulation"]:
                 retriever = self.retrievers.get(question_type)
-                result = retriever.retrieve(query, question_type=question_type)
+                result = retriever.retrieve(query_text, question_type=question_type)
             elif self._lc_retriever_map and documents_to_result and question_type in self._lc_retriever_map:
                 # LangChain 编排：通过 BaseRetriever 统一调用
                 lc_ret = self._lc_retriever_map.get(question_type, self._lc_retriever_map["chapter_rag"])
                 try:
-                    docs = lc_ret.invoke(query)
+                    docs = lc_ret.invoke(query_text)
                     result = documents_to_result(docs)
                 except Exception as e:
                     logger.warning(f"LangChain 检索调用异常: {e}，回退到直接调用")
                     retriever = self.retrievers.get(question_type, self.retrievers["chapter_rag"])
-                    result = retriever.retrieve(query)
+                    # chapter_rag 可吃结构化 payload，其它检索器用 query_text
+                    if question_type == "chapter_rag":
+                        result = retriever.retrieve(chapter_query)
+                    else:
+                        result = retriever.retrieve(query_text)
             else:
                 retriever = self.retrievers.get(question_type, self.retrievers["chapter_rag"])
-                result = retriever.retrieve(query)
+                if question_type == "chapter_rag":
+                    result = retriever.retrieve(chapter_query)
+                else:
+                    result = retriever.retrieve(query_text)
             
             # 如果检索失败，回退到章节RAG（行为分析类问题不回退）
             if result.get('fallback', False) and question_type not in ["chapter_rag", "behavior_explanation", "scenario_simulation"]:
                 logger.warning(f"{question_type}检索失败，回退到章节RAG...")
-                result = self.retrievers["chapter_rag"].retrieve(query)
+                result = self.retrievers["chapter_rag"].retrieve(chapter_query)
             
             # 处理章节摘要回退
             if question_type == "global_summary" and result.get('fallback', False):
                 logger.warning("全局摘要为空，回退到章节摘要...")
-                result = self.retrievers["chapter_summary"].retrieve(query)
+                result = self.retrievers["chapter_summary"].retrieve(query_text)
                 if result.get('fallback', False):
                     logger.warning("章节摘要也失败，回退到章节RAG...")
-                    result = self.retrievers["chapter_rag"].retrieve(query)
+                    result = self.retrievers["chapter_rag"].retrieve(chapter_query)
             
             return result
         
@@ -1500,13 +2002,14 @@ class LLMRAGSystem:
         if question_type in ["behavior_explanation", "scenario_simulation"]:
             # 先进行RAG检索获取原文片段（用于事实核查）
             rag_retriever = self.retrievers.get("chapter_rag")
-            rag_result = rag_retriever.retrieve(query)
+            # 行为分析：章节原文也支持多 query 合并检索
+            rag_result = rag_retriever.retrieve(chapter_query)
             rag_original_text = rag_result.get('context', '')
             rag_sources = rag_result.get('sources', [])
             
             # 获取行为分析模块的上下文（传入RAG原文片段，让其按新顺序组织）
             behavior_retriever = self.retrievers.get(question_type)
-            behavior_result = behavior_retriever.retrieve(query, question_type=question_type, rag_original_text=rag_original_text)
+            behavior_result = behavior_retriever.retrieve(query_text, question_type=question_type, rag_original_text=rag_original_text)
             behavior_context = behavior_result.get('context', '')
             behavior_sources = behavior_result.get('sources', [])
             additional_knowledge = behavior_result.get('additional_knowledge')
@@ -1576,7 +2079,7 @@ class LLMRAGSystem:
             if question_type == "chapter_rag":
                 try:
                     timeline_retriever = self.retrievers.get("timeline_db")
-                    timeline_result = timeline_retriever.retrieve(query, top_k=5)
+                    timeline_result = timeline_retriever.retrieve(query_text, top_k=5)
                     if timeline_result and not timeline_result.get('fallback', True) and timeline_result.get('context'):
                         timeline_context = timeline_result.get('context', '')
                         timeline_sources = timeline_result.get('sources', [])
@@ -1584,7 +2087,7 @@ class LLMRAGSystem:
                 except Exception as e:
                     logger.warning(f"[事实核查] 时间线检索异常，跳过: {e}")
                 try:
-                    event_chain_results = self.rag_system.search_event_chain(query, top_k=4)
+                    event_chain_results = self.rag_system.search_event_chain(query_text, top_k=4)
                     if event_chain_results:
                         parts = []
                         for r in event_chain_results:
@@ -1712,7 +2215,7 @@ class LLMRAGSystem:
                 try:
                     # 先进行一次初始检索，获取初始上下文用于reasoning判断
                     rewrite_start_time = time.time()
-                    rewritten_query = self._rewrite_query(user_query)
+                    rewritten_query = self._rewrite_query_safe(user_query)
                     rewrite_time = time.time() - rewrite_start_time
                     initial_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                     initial_context = initial_result.get("context", "")
@@ -1758,7 +2261,7 @@ class LLMRAGSystem:
                     logger.error(f"Reasoning模块调用失败: {e}，回退到单次检索")
                     # 回退到单次检索
                     rewrite_start_time = time.time()
-                    rewritten_query = self._rewrite_query(user_query)
+                    rewritten_query = self._rewrite_query_safe(user_query)
                     rewrite_time = time.time() - rewrite_start_time
                     rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                     context = rag_result["context"]
@@ -1770,8 +2273,12 @@ class LLMRAGSystem:
             else:
                 # 其他问题类型直接使用单次检索（不需要reasoning判断）
                 logger.info(f"[{question_type}] 非行为分析类问题，直接使用单次检索")
-                rewritten_query = self._rewrite_query(user_query)
-                rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
+                rewritten_query = self._rewrite_query_safe(user_query)
+                if question_type == "chapter_rag":
+                    queries = self._build_multi_query_variants(user_query, rewritten_query)
+                    rag_result = self._retrieve_context(queries, question_type, original_query=user_query)
+                else:
+                    rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                 context = rag_result["context"]
                 sources = rag_result["sources"]
                 target_source = rag_result["target_source"]
@@ -1993,7 +2500,7 @@ class LLMRAGSystem:
                 # 只对行为解释类和情节推演类问题使用reasoning模块
                 try:
                     # 先进行一次初始检索，获取初始上下文用于reasoning判断
-                    rewritten_query = self._rewrite_query(user_query)
+                    rewritten_query = self._rewrite_query_safe(user_query)
                     initial_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                     initial_context = initial_result.get("context", "")
                     
@@ -2051,7 +2558,7 @@ class LLMRAGSystem:
                 except Exception as e:
                     logger.error(f"Reasoning模块调用失败: {e}，回退到单次检索")
                     # 回退到单次检索
-                    rewritten_query = self._rewrite_query(user_query)
+                    rewritten_query = self._rewrite_query_safe(user_query)
                     rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                     context = rag_result.get("context", "")
                     sources = rag_result.get("sources", [])
@@ -2061,9 +2568,14 @@ class LLMRAGSystem:
                 # 其他问题类型直接使用单次检索（不需要reasoning判断）
                 logger.info(f"[chat_stream][{question_type}] 非行为分析类问题，直接使用单次检索")
                 rewrite_start_time = time.time()
-                rewritten_query = self._rewrite_query(user_query)
+                rewritten_query = self._rewrite_query_safe(user_query)
                 rewrite_time = time.time() - rewrite_start_time
-                rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
+                # chapter_rag: 多 query（纯字符串）并行检索合并；其他类型仍用单条字符串
+                if question_type == "chapter_rag":
+                    queries = self._build_multi_query_variants(user_query, rewritten_query)
+                    rag_result = self._retrieve_context(queries, question_type, original_query=user_query)
+                else:
+                    rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
                 context = rag_result.get("context", "")
                 sources = rag_result.get("sources", [])
                 target_source = rag_result.get("target_source", None)

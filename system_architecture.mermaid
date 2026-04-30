@@ -1,0 +1,68 @@
+%% Novel RAG System - Architecture (2026-04-30)
+%% - 数据源以 zip（数据源.pack.zip）提交，启动时自动解压到 数据源/
+%% - 英文/混合问句：one-shot 改写为中文关键词串；chapter_rag 走多 query（纯字符串）并行检索合并
+
+flowchart TB
+  %% ============== Client / Server ==============
+  subgraph Client["浏览器（用户侧）"]
+    UI["UI\n- templates/chat.html\n- static/chat.js"]
+    LS["localStorage（可选）\n- 对话树/历史\n- share_consent"]
+  end
+
+  subgraph API["服务端 FastAPI（web_chat.py）"]
+    Route["/api/route-check\n路由判断"]
+    Chat["/api/chat (SSE)\n流式问答"]
+    Shared["/api/shared_history（可选）\n共享历史（内存）"]
+    LLMRAG["LLMRAGSystem\nllm_rag_system.py"]
+  end
+
+  Client --> Route
+  Client --> Chat
+  Client --> Shared
+  UI --> LS
+  Route --> LLMRAG
+  Chat --> LLMRAG
+
+  %% ============== Data source packaging ==============
+  subgraph Data["数据源与打包"]
+    Zip["数据源.pack.zip（提交到仓库）"]
+    Dir["数据源/（运行时目录）\n- 人物.json\n- 时间线梳理.txt\n- 关键事件链条.json\n- 元文本知识库.json\n- 意象系统.txt\n- ..."]
+    Loader["data_source_loader.py\n若无 数据源/ 则解压 zip"]
+  end
+
+  Zip --> Loader
+  Loader --> Dir
+
+  %% ============== RAG core ==============
+  subgraph RAG["RAG 核心（rag_system.py + rag_modules/*）"]
+    Core["NovelRAGSystem\n- build_index()\n- search()/search_multi()"]
+    Vec["ChromaDB（持久化）\nchroma_db/\ncollections: main/sequel"]
+    BM25["BM25 + jieba\nbm25_*_cache.pkl"]
+    Ret["Retrievers\n- ChapterRAGRetriever\n- Timeline/Imagery/Meta...\n- DynamicSummary(可选)"]
+  end
+
+  Dir --> Core
+  Core --> Vec
+  Core --> BM25
+  LLMRAG --> Ret
+  LLMRAG --> Core
+
+  %% ============== External APIs ==============
+  subgraph External["外部 API"]
+    DS["DeepSeek Chat API\n（路由/改写/回答）"]
+    QF["百度千帆 Embedding API\n（向量化/检索向量）"]
+  end
+
+  LLMRAG --> DS
+  Core --> QF
+
+  %% ============== Query rewrite & retrieval logic ==============
+  subgraph Logic["查询改写与检索（核心逻辑）"]
+    InQ["用户问句（可能英文/混合）"]
+    Rewrite["one-shot 改写\n输出：中文关键词串（空格分词）\n默认不保留英文 token"]
+    Variants["chapter_rag：生成 2-4 条变体 query（纯字符串）\n主题/科目/学科/题目 等"]
+    Multi["search_multi：逐条检索 top_k_per_query\n合并去重重排"]
+  end
+
+  InQ --> Rewrite --> Variants --> Multi --> Core
+

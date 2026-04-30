@@ -2,7 +2,7 @@
 章节RAG检索器（混合检索）
 """
 import logging
-from typing import Dict
+from typing import Dict, Any, List, Union
 from .base_retriever import BaseRetriever
 
 logger = logging.getLogger(__name__)
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class ChapterRAGRetriever(BaseRetriever):
     """章节RAG检索器（使用混合检索）"""
     
-    def retrieve(self, query: str, top_k: int = 10) -> Dict:
+    def retrieve(self, query: Union[str, Dict[str, Any], List[str]], top_k: int = 10) -> Dict:
         """
         使用混合检索（语义向量 + BM25）检索章节内容
         
@@ -23,14 +23,39 @@ class ChapterRAGRetriever(BaseRetriever):
             检索结果字典
         """
         logger.info("使用混合检索（语义向量 + BM25）...")
-        
-        # 执行混合检索
-        search_results = self.rag_system.search(
-            query=query,
-            top_k=top_k,
-            use_background=True,
-            use_hybrid=True
-        )
+
+        # 多 query（纯字符串）并行检索合并
+        if isinstance(query, list):
+            queries: List[str] = [q.strip() for q in query if isinstance(q, str) and q.strip()]
+            search_results = self.rag_system.search_multi(
+                queries=queries,
+                entities=[],
+                top_k_per_query=3,
+                top_k_final=top_k,
+                use_background=True,
+                use_hybrid=True,
+            )
+        # 兼容结构化多 query 检索（历史兼容；建议上游改用 list[str]）
+        elif isinstance(query, dict):
+            queries: List[str] = query.get("queries") or []
+            entities: List[str] = query.get("entities") or []
+            top_k_per_query = int(query.get("top_k_per_query") or 3)
+            search_results = self.rag_system.search_multi(
+                queries=queries,
+                entities=entities,
+                top_k_per_query=max(1, top_k_per_query),
+                top_k_final=top_k,
+                use_background=True,
+                use_hybrid=True,
+            )
+        else:
+            # 执行混合检索
+            search_results = self.rag_system.search(
+                query=query,
+                top_k=top_k,
+                use_background=True,
+                use_hybrid=True
+            )
         
         # 记录检索结果
         logger.info(f"\n检索到 {len(search_results.get('main_results', []))} 个主文档结果")
