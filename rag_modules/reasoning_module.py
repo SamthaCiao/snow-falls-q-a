@@ -126,11 +126,15 @@ class ReasoningModule:
             }
             
             payload = {
-                "model": "deepseek-reasoner",
+                # deepseek-reasoner 将在 2026/07/24 弃用；对应 deepseek-v4-pro 的 thinking mode
+                "model": "deepseek-v4-pro",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
+                # thinking mode（等价于旧 deepseek-reasoner 的行为）
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
                 "stream": False,
                 "temperature": 0.3
             }

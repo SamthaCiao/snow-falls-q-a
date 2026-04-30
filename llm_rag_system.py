@@ -126,7 +126,9 @@ class LLMRAGSystem:
         else:
             # 如果使用DeepSeek但没有设置base_url，使用DeepSeek的默认地址
             if is_deepseek:
-                client_kwargs["base_url"] = "https://api.deepseek.com/v1"
+                # DeepSeek OpenAI-compatible base_url
+                # 官方文档示例：base_url = https://api.deepseek.com
+                client_kwargs["base_url"] = "https://api.deepseek.com"
         
         self.client = OpenAI(**client_kwargs)
         step_time = time.time() - step_start
@@ -139,7 +141,8 @@ class LLMRAGSystem:
         if model == "gpt-3.5-turbo":  # 如果使用默认模型
             if is_deepseek:
                 # DeepSeek的模型名称
-                self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
+                # deepseek-chat 将在 2026/07/24 弃用，推荐使用 deepseek-v4-flash（非 thinking）
+                self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-v4-flash')
             else:
                 self.model = model
         else:
