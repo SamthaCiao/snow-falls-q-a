@@ -37,6 +37,13 @@ except ImportError:
     documents_to_result = None  # type: ignore
     _HAS_LC_ADAPTER = False
 
+try:
+    from observation.context_hints import ContextHintRouter
+    _HAS_OBSERVATION = True
+except ImportError:
+    ContextHintRouter = None  # type: ignore
+    _HAS_OBSERVATION = False
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -148,8 +155,13 @@ class LLMRAGSystem:
                 self.model = model
         else:
             self.model = model
+        self.reasoner_model = os.getenv('DEEPSEEK_REASONER_MODEL', 'deepseek-v4-pro')
+        self.enable_quote_validation = os.getenv('ENABLE_QUOTE_VALIDATION', 'true').lower() == 'true'
+        self.answer_max_tokens = int(os.getenv('DEEPSEEK_ANSWER_MAX_TOKENS', '4096'))
         step_time = time.time() - step_start
         logger.info(f"        ✓ 模型选择完成: {self.model} (耗时: {step_time:.2f}秒)")
+        logger.info(f"        深度分析/Reasoner 模型: {self.reasoner_model}")
+        logger.info(f"        引文校验: {'启用' if self.enable_quote_validation else '禁用'}")
         
         # 步骤6: 检查百度API配置
         step_start = time.time()
@@ -226,6 +238,9 @@ class LLMRAGSystem:
             self.reasoning_module = None
         step_time = time.time() - step_start
         logger.info(f"        ✓ Reasoning模块初始化完成 (耗时: {step_time:.2f}秒)")
+
+        self.hint_router = ContextHintRouter() if _HAS_OBSERVATION and ContextHintRouter else None
+        self._last_observation_hint_time = 0.0
         
         # 总结
         total_time = time.time() - start_time
@@ -927,6 +942,125 @@ class LLMRAGSystem:
         merged = merged[:10]
         return " ".join(merged).strip() if merged else (fallback_text or base or "").strip()
 
+    def _select_answer_model(
+        self,
+        question_type: Optional[str],
+        is_behavior_analysis: bool,
+        is_meta_analysis: bool,
+    ) -> str:
+        """行为解释/情节推演/元文本分析走 Reasoner（v4-pro），其余走 flash。"""
+        if is_behavior_analysis or question_type == "scenario_simulation":
+            return self.reasoner_model
+        if is_meta_analysis:
+            return self.reasoner_model
+        return self.model
+
+    def _build_validation_retry_message(self, issues: Dict[str, Any]) -> str:
+        parts = [
+            "你上一版回答存在缺乏原文/检索材料支撑的内容，请重新作答：",
+        ]
+        invalid_quotes = issues.get("invalid_quotes") or []
+        invalid_facts = issues.get("invalid_facts") or []
+        if invalid_quotes:
+            samples = "\n".join(f"- 引文「{q}」" for q in invalid_quotes[:3])
+            parts.append("【幻觉引文】以下引文在原文片段中找不到：")
+            parts.append(samples)
+            parts.append("引号内文字必须逐字来自原文；无法对应时请转述，不要加引号。")
+        if invalid_facts:
+            samples = "\n".join(f"- {s[:80]}{'…' if len(s) > 80 else ''}" for s in invalid_facts[:3])
+            parts.append("【缺乏依据的具体陈述】以下句子在提供的材料中支撑不足：")
+            parts.append(samples)
+            parts.append("请删除或改写为分析性表述（可用「可能/似乎」），或仅保留材料中明确出现的事实。")
+        parts.append("可保留合理分析，但具体情节/时间/行为须有材料依据。")
+        return "\n".join(parts)
+
+    def _validate_and_retry_answer(
+        self,
+        answer: str,
+        context: str,
+        messages: List[Dict],
+        model: str,
+        *,
+        check_facts: bool = True,
+        max_retries: int = 2,
+    ) -> Tuple[str, bool]:
+        """引文 + 事实 grounding 校验；未通过则打回重写，仍失败则剥离无效引号。"""
+        from rag_modules.quote_validator import (
+            validate_answer,
+            sanitize_invalid_quotes,
+            append_grounding_disclaimer,
+        )
+
+        if not self.enable_quote_validation or not (answer or "").strip():
+            return answer, False
+        if not context or not context.strip():
+            return answer, False
+
+        retried = False
+        current = answer
+        for attempt in range(max_retries + 1):
+            passed, issues = validate_answer(
+                current, context, check_facts=check_facts
+            )
+            if passed:
+                return current, retried
+            if attempt >= max_retries:
+                invalid_quotes = issues.get("invalid_quotes") or []
+                invalid_facts = issues.get("invalid_facts") or []
+                if invalid_quotes:
+                    logger.warning(
+                        "[回答校验] 已达重试上限，剥离无效引文: %s",
+                        invalid_quotes[:2],
+                    )
+                    current = sanitize_invalid_quotes(current, invalid_quotes)
+                if invalid_facts:
+                    logger.warning(
+                        "[回答校验] 仍有缺乏依据的事实句: %s",
+                        [s[:40] for s in invalid_facts[:2]],
+                    )
+                    current = append_grounding_disclaimer(current, invalid_facts)
+                return current, True
+
+            logger.warning(
+                "[回答校验] 第 %d 次未通过 quotes=%d facts=%d",
+                attempt + 1,
+                len(issues.get("invalid_quotes") or []),
+                len(issues.get("invalid_facts") or []),
+            )
+            retry_messages = list(messages)
+            retry_messages.append({"role": "assistant", "content": current})
+            retry_messages.append(
+                {"role": "user", "content": self._build_validation_retry_message(issues)}
+            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=retry_messages,
+                    temperature=0.3,
+                    max_tokens=self.answer_max_tokens,
+                    stream=False,
+                )
+                current = (response.choices[0].message.content or "").strip() or current
+                retried = True
+            except Exception as e:
+                logger.error(f"[回答校验] 重写失败: {e}")
+                return current, retried
+        return current, retried
+
+    def _collect_llm_answer(self, messages: List[Dict], model: str, temperature: float = 0.7) -> str:
+        stream = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=self.answer_max_tokens,
+            stream=True,
+        )
+        full_answer = ""
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                full_answer += chunk.choices[0].delta.content
+        return full_answer
+
     def _rewrite_keywords_one_shot(self, raw_query: str) -> str:
         """
         降本版：一次 LLM 调用同时完成（必要时翻译为中文 + 改写为检索关键词串）。
@@ -1375,58 +1509,11 @@ class LLMRAGSystem:
         # 步骤3：短时记忆 - 保留最近3轮对话
         short_term_count = 3  # 3轮对话 = 6条消息（每轮包含user和assistant）
         short_term_history = normalized[-short_term_count * 2:] if len(normalized) > short_term_count * 2 else normalized
-        
-        # 步骤4：长时记忆 - 对话记忆摘要（每5轮对话生成一次摘要）
-        long_term_summary = None
-        if len(normalized) > 10:  # 如果历史超过10条消息（约5轮对话）
-            # 提取早期对话（除了最近3轮）
-            early_history = normalized[:-short_term_count * 2] if len(normalized) > short_term_count * 2 else []
-            
-            if early_history:
-                # 生成摘要（简化实现：提取关键信息）
-                try:
-                    summary_prompt = f"""请从以下对话历史中提取关键信息，生成一个简洁的摘要。
 
-对话历史：
-{chr(10).join([f"{msg['role']}: {msg['content'][:200]}" for msg in early_history[-10:]])}
-
-要求：
-1. 提取用户偏好、已确认的信息、待澄清的问题
-2. 保留重要的人物、事件、概念
-3. 摘要长度控制在200字以内
-4. 只返回摘要内容，不要添加额外说明
-
-摘要："""
-                    
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": "你是一个专业的对话摘要专家，擅长从对话历史中提取关键信息。"},
-                            {"role": "user", "content": summary_prompt}
-                        ],
-                        temperature=0.3,
-                        max_tokens=300
-                    )
-                    
-                    long_term_summary = response.choices[0].message.content.strip()
-                    logger.info(f"[对话摘要] 生成长时记忆摘要，长度: {len(long_term_summary)} 字符")
-                except Exception as e:
-                    logger.warning(f"生成对话摘要失败: {e}")
-
-        # 步骤5：合并短时记忆和长时记忆
-        final_history = []
+        # 长时摘要已迁移至独立「用户观测模块」异步生成，主对话不再同步调用 LLM 摘要
+        final_history = list(short_term_history)
         
-        # 如果有长时记忆摘要，添加为系统消息格式的摘要
-        if long_term_summary:
-            final_history.append({
-                "role": "system",
-                "content": f"[对话历史摘要] {long_term_summary}"
-            })
-        
-        # 添加短时记忆（最近3轮对话）
-        final_history.extend(short_term_history)
-        
-        # 步骤6：按字符数裁剪（如果仍然过长）
+        # 步骤4：按条数裁剪
         if len(final_history) > max_messages:
             final_history = final_history[-max_messages:]
         
@@ -1445,6 +1532,26 @@ class LLMRAGSystem:
         result = list(reversed(trimmed_rev))
         logger.info(f"[上下文管理] 最终保留 {len(result)} 条消息，总字符数: {total}")
         return result
+
+    def _merge_observation_hint_queries(
+        self,
+        base_queries: List[str],
+        user_query: str,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """将观测模块 retrieval_hints 与当前问题竞争后并入多 query 检索（非 prompt 标签）。"""
+        if not self.hint_router or not session_id or not user_id:
+            return base_queries
+        hints, hint_time = self.hint_router.select_hint_queries(
+            session_id=session_id,
+            user_id=user_id,
+            current_query=user_query,
+        )
+        self._last_observation_hint_time = hint_time
+        if not hints:
+            return base_queries
+        return self.hint_router.merge_into_multi_queries(base_queries, hints)
     
     def _route_question(self, user_query: str) -> Tuple[bool, str, str, str]:
         """
@@ -2182,7 +2289,8 @@ class LLMRAGSystem:
             "rag_time": rag_elapsed_time  # 添加RAG检索耗时
         }
     
-    def chat(self, user_query: str, conversation_history: List[Dict] = None) -> Dict:
+    def chat(self, user_query: str, conversation_history: List[Dict] = None,
+             session_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict:
         """
         处理用户查询，智能判断是否需要RAG
         
@@ -2276,6 +2384,7 @@ class LLMRAGSystem:
                 rewritten_query = self._rewrite_query_safe(user_query)
                 if question_type == "chapter_rag":
                     queries = self._build_multi_query_variants(user_query, rewritten_query)
+                    queries = self._merge_observation_hint_queries(queries, user_query, session_id, user_id)
                     rag_result = self._retrieve_context(queries, question_type, original_query=user_query)
                 else:
                     rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
@@ -2319,6 +2428,16 @@ class LLMRAGSystem:
 - 回答要体现对创作技巧和意图的深度理解
 - **信息来源规范（必须遵守）**：对用户呈现时，信息来源一律只写「原文」或「作品原文」。严禁在回答中出现时间线、人物画像、元文本知识库、关键事件链条、作者解读等任何内部数据源名称；只使用其内容作答，若需说明来源则仅写「原文」。
 - **必须结合对话历史**：延续上下文、指代一致、不要把同一会话当作单轮问答"""
+        elif is_behavior_analysis:
+            system_prompt = """你是严谨的文学分析师，基于提供的上下文回答问题。
+
+**动机采信原则**：优先采信人物自述的动机，其次再结合外部事件关联；人物自述动机高于外部推断。
+
+注意：
+- 回答需充分展开：分层次阐述心理机制与事件关联，避免过于简略。
+- 引号内引文必须逐字来自【原文片段】；无法逐字对应时请转述，不要加引号。
+- **信息来源规范（必须遵守）**：对用户呈现时，信息来源一律只写「原文」或「作品原文」。严禁在回答中出现时间线、人物画像、元文本分析、心理模型等任何内部数据源名称。
+- 必须结合对话历史：延续上下文、指代一致"""
         else:
             system_prompt = f"""你是一个专业的小说问答助手，专门回答关于《雪落成诗》和《影化成殇》这两部小说的问题。
 
@@ -2402,13 +2521,19 @@ class LLMRAGSystem:
                         "若问具体事件时间，以上下文中与问题事件匹配的时间点为准（最细时间如「高三深秋」）；同一章内多处时间标记时，以紧贴该事件的时间为准。"
                         "回答时仅引用与问题直接相关的人物，不要罗列无关人物信息。"
                     )
+                timeline_answer_hint = ""
+                if question_type == "timeline_db":
+                    timeline_answer_hint = (
+                        "\n\n**时间线作答要求**：以上【时间线】为全书事件索引，请按时间顺序归纳各阶段关键转折；"
+                        "若上下文中出现高二、高三、大学、高考后等阶段，须一并作答，勿声称材料仅覆盖高一。"
+                    )
                 user_message = f"""基于以下文档内容回答用户问题：
 
 {context}
 
 用户问题：{user_query}
 
-请基于上述文档内容回答问题。如果文档中没有相关信息，请诚实说明。{fact_check_hint}{structured_source_hint}"""
+请基于上述文档内容回答问题。{timeline_answer_hint}{fact_check_hint}{structured_source_hint}"""
         else:
             user_message = user_query
         
@@ -2422,16 +2547,25 @@ class LLMRAGSystem:
         messages.append({"role": "user", "content": user_message})
         
         # 调用LLM生成回答
-        logger.info("正在调用LLM生成回答...")
+        answer_model = self._select_answer_model(
+            question_type if need_rag else None,
+            is_behavior_analysis,
+            is_meta_analysis,
+        )
+        logger.info(f"正在调用LLM生成回答... model={answer_model}")
         try:
             response = self.client.chat.completions.create(
-                model=self.model,
+                model=answer_model,
                 messages=messages,
                 temperature=0.7,
+                max_tokens=self.answer_max_tokens,
                 stream=False
             )
             
             answer = response.choices[0].message.content
+            answer, quote_retried = self._validate_and_retry_answer(answer, context, messages, answer_model)
+            if quote_retried:
+                logger.info("[引文校验] 已打回并重写完成")
             
             logger.info("LLM回答生成完成\n")
             
@@ -2457,7 +2591,8 @@ class LLMRAGSystem:
                 "is_meta_analysis": False
             }
     
-    def chat_stream(self, user_query: str, conversation_history: List[Dict] = None):
+    def chat_stream(self, user_query: str, conversation_history: List[Dict] = None,
+                    session_id: Optional[str] = None, user_id: Optional[str] = None):
         """
         流式处理用户查询（用于实时显示）
         
@@ -2468,6 +2603,7 @@ class LLMRAGSystem:
         # 记录各阶段开始时间
         total_start_time = time.time()
         route_start_time = time.time()
+        self._last_observation_hint_time = 0.0
         
         conversation_history = self._normalize_and_trim_history(conversation_history, current_query=user_query)
         
@@ -2573,6 +2709,7 @@ class LLMRAGSystem:
                 # chapter_rag: 多 query（纯字符串）并行检索合并；其他类型仍用单条字符串
                 if question_type == "chapter_rag":
                     queries = self._build_multi_query_variants(user_query, rewritten_query)
+                    queries = self._merge_observation_hint_queries(queries, user_query, session_id, user_id)
                     rag_result = self._retrieve_context(queries, question_type, original_query=user_query)
                 else:
                     rag_result = self._retrieve_context(rewritten_query, question_type, original_query=user_query)
@@ -2629,6 +2766,8 @@ class LLMRAGSystem:
 **动机采信原则**：优先采信人物自述的动机，其次再结合外部事件关联；人物自述动机高于外部推断。回答时按事实核查→模式分析→组织答案的流程进行。
 
 注意：
+- 回答需充分展开：分层次阐述心理机制与事件关联，避免过于简略。
+- 引号内引文必须逐字来自【原文片段】；无法逐字对应时请转述，不要加引号。
 - **信息来源规范（必须遵守）**：对用户呈现时，信息来源一律只写「原文」或「作品原文」。严禁在回答中出现时间线、人物画像、元文本分析、心理模型等任何内部数据源名称；只使用其内容作答，若需说明来源则仅写「原文」。
 - 必须结合对话历史：延续上下文、指代一致"""
         else:
@@ -2703,13 +2842,19 @@ class LLMRAGSystem:
                         "若问具体事件时间，以上下文中与问题事件匹配的时间点为准（最细时间如「高三深秋」）；同一章内多处时间标记时，以紧贴该事件的时间为准。"
                         "回答时仅引用与问题直接相关的人物，不要罗列无关人物信息。"
                     )
+                timeline_answer_hint = ""
+                if question_type == "timeline_db":
+                    timeline_answer_hint = (
+                        "\n\n**时间线作答要求**：以上【时间线】为全书事件索引，请按时间顺序归纳各阶段关键转折；"
+                        "若上下文中出现高二、高三、大学、高考后等阶段，须一并作答，勿声称材料仅覆盖高一。"
+                    )
                 user_message = f"""基于以下文档内容回答用户问题：
 
 {context}
 
 用户问题：{user_query}
 
-请基于上述文档内容回答问题。如果文档中没有相关信息，请诚实说明。{fact_check_hint}{structured_source_hint}"""
+请基于上述文档内容回答问题。{timeline_answer_hint}{fact_check_hint}{structured_source_hint}"""
         else:
             user_message = user_query
         
@@ -2734,24 +2879,26 @@ class LLMRAGSystem:
         
         messages.append({"role": "user", "content": user_message})
         
-        # 流式调用LLM
+        # 流式调用LLM（先完整生成并校验引文，再分块输出，避免幻觉引文直接展示）
         import time
         llm_start_time = time.time()
-        logger.info("正在流式调用LLM生成回答...")
+        answer_model = self._select_answer_model(
+            question_type if need_rag else None,
+            is_behavior_analysis,
+            is_meta_analysis,
+        )
+        logger.info(f"正在生成回答（校验后流式输出）... model={answer_model}")
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.7,
-                stream=True
+            full_answer = self._collect_llm_answer(messages, answer_model, temperature=0.7)
+            full_answer, quote_retried = self._validate_and_retry_answer(
+                full_answer, context, messages, answer_model
             )
-            
-            full_answer = ""
-            for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    full_answer += content
-                    yield content, False
+            if quote_retried:
+                logger.info("[引文校验] 已打回并重写完成")
+            # 分块 yield，保持前端流式体验
+            chunk_size = 24
+            for i in range(0, len(full_answer), chunk_size):
+                yield full_answer[i:i + chunk_size], False
             
             llm_end_time = time.time()
             llm_elapsed_time = llm_end_time - llm_start_time
@@ -2793,7 +2940,8 @@ class LLMRAGSystem:
                 "rag_time": final_rag_time,
                 "llm_time": final_llm_time,
                 "other_time": other_time,
-                "total_time": total_time
+                "total_time": total_time,
+                "observation_hint_time": getattr(self, "_last_observation_hint_time", 0.0),
             }, True
             
         except Exception as e:

@@ -1,68 +1,151 @@
-%% Novel RAG System - Architecture (2026-04-30)
-%% - 数据源以 zip（数据源.pack.zip）提交，启动时自动解压到 数据源/
-%% - 英文/混合问句：one-shot 改写为中文关键词串；chapter_rag 走多 query（纯字符串）并行检索合并
+%% 雪落回声 · 系统架构（2026-06-28）
+%% 主入口 web_chat.py + user_observer.py；备用 api.py / chat_ui.py
+%% 数据源：仓库提交 数据源.pack.zip，启动解压到 数据源/
 
 flowchart TB
-  %% ============== Client / Server ==============
+  %% ===================== 客户端 =====================
   subgraph Client["浏览器（用户侧）"]
-    UI["UI\n- templates/chat.html\n- static/chat.js"]
-    LS["localStorage（可选）\n- 对话树/历史\n- share_consent"]
+    UI["Web UI\ntemplates/chat.html"]
+    ChatJS["static/chat.js\nSSE 对话 · 共享历史 · 观测面板"]
+    StarGL["static/star_map_gl.js\n探索星图 WebGL"]
+    LS["localStorage\n· 对话树 / 匿名 ID\n· observation_session_id"]
+    UI --> ChatJS
+    UI --> StarGL
+    ChatJS --> LS
   end
 
-  subgraph API["服务端 FastAPI（web_chat.py）"]
-    Route["/api/route-check\n路由判断"]
-    Chat["/api/chat (SSE)\n流式问答"]
-    Shared["/api/shared_history（可选）\n共享历史（内存）"]
-    LLMRAG["LLMRAGSystem\nllm_rag_system.py"]
+  %% ===================== 进程 A：主对话 =====================
+  subgraph ProcA["进程 A · 主对话（web_chat.py · :8000）"]
+    direction TB
+    subgraph Routes["FastAPI 路由"]
+      R0["GET / · HTML"]
+      R1["POST /api/chat · SSE 流式"]
+      R2["POST /api/route-check"]
+      R3["GET/POST /api/shared_history\n内存共享历史"]
+      R4["/auth/* · /api/auth/me"]
+      R5["/api/observation/*\n轨迹 · 星图 · 触发 · 修正"]
+      R6["WebSocket /ws\n流式 + 观测写入"]
+    end
+    Auth["auth/google_oauth.py\nGoogle OAuth 或匿名 ID\nX-Anonymous-User-Id / cookie"]
+    EventW["observation/event_writer.py\n每轮对话 append 事件"]
+    ObsRead["observation/state_store.py\n只读 state / 星图 API"]
+    LLM["LLMRAGSystem\nllm_rag_system.py"]
+    Routes --> Auth
+    R1 --> LLM
+    R2 --> LLM
+    R1 --> EventW
+    R5 --> ObsRead
   end
 
-  Client --> Route
-  Client --> Chat
-  Client --> Shared
-  UI --> LS
-  Route --> LLMRAG
-  Chat --> LLMRAG
+  Client --> Routes
 
-  %% ============== Data source packaging ==============
-  subgraph Data["数据源与打包"]
-    Zip["数据源.pack.zip（提交到仓库）"]
-    Dir["数据源/（运行时目录）\n- 人物.json\n- 时间线梳理.txt\n- 关键事件链条.json\n- 元文本知识库.json\n- 意象系统.txt\n- ..."]
-    Loader["data_source_loader.py\n若无 数据源/ 则解压 zip"]
+  %% ===================== LLM 编排层 =====================
+  subgraph Orchestration["LLM 编排（llm_rag_system.py）"]
+    RouteLLM["统一路由\nneed_rag + question_type\nDeepSeek JSON"]
+    Rewrite["查询改写\n英文/混合 → 中文关键词"]
+    Variants["chapter_rag 多 query 变体\nsearch_multi 合并去重"]
+    HintR["ContextHintRouter\nobservation retrieval_hints\n仅扩展检索 query"]
+    Reason["ReasoningModule\n行为/推演类多跳检索"]
+    QuoteV["quote_validator\n引文 + 事实句 grounding\n最多 2 次打回 · 失败剥离引号"]
+    Gen["回答生成\nflash / reasoner 分模型"]
+    RouteLLM --> Rewrite --> Variants
+    Variants --> HintR
+    RouteLLM --> Reason
+    Gen --> QuoteV
   end
 
-  Zip --> Loader
-  Loader --> Dir
+  LLM --> Orchestration
 
-  %% ============== RAG core ==============
+  %% ===================== RAG 核心 =====================
   subgraph RAG["RAG 核心（rag_system.py + rag_modules/*）"]
-    Core["NovelRAGSystem\n- build_index()\n- search()/search_multi()"]
-    Vec["ChromaDB（持久化）\nchroma_db/\ncollections: main/sequel"]
+    Core["NovelRAGSystem\nbuild_index · search · search_multi"]
+    Vec["ChromaDB 持久化\nchroma_db/\nmain · sequel"]
     BM25["BM25 + jieba\nbm25_*_cache.pkl"]
-    Ret["Retrievers\n- ChapterRAGRetriever\n- Timeline/Imagery/Meta...\n- DynamicSummary(可选)"]
+    Ret["9 路检索器\nGlobalSummary · Timeline · CharacterArc\nImagery · Meta · ChapterRAG\nChapterSummary · BehaviorAnalyzer"]
+    LC["langchain_adapters.py\n可选 LangChain BaseRetriever 封装"]
+    Struct["StructuredQueryEngine\nJSON 知识库字段精准抽取"]
+    DynSum["DynamicSummaryGenerator\n复杂问题动态摘要（可选）"]
+    Core --> Vec
+    Core --> BM25
+    LLM --> Ret
+    LLM --> Core
+    Ret --> Struct
+    Ret --> DynSum
+    Ret -.-> LC
   end
 
-  Dir --> Core
-  Core --> Vec
-  Core --> BM25
-  LLMRAG --> Ret
-  LLMRAG --> Core
+  %% ===================== 数据源 =====================
+  subgraph Data["数据源与打包"]
+    Zip["数据源.pack.zip（可提交）"]
+    Dir["数据源/（运行时，不提交）\n雪落成诗/影化成殇 txt\n人物.json · 时间线 · 意象\n元文本 · 关键事件 · 章节映射"]
+    Loader["data_source_loader.py\n无目录时自动解压 zip"]
+    Zip --> Loader --> Dir
+    Dir --> Core
+    Dir --> Ret
+  end
 
-  %% ============== External APIs ==============
+  %% ===================== 外部 API =====================
   subgraph External["外部 API"]
-    DS["DeepSeek Chat API\n（路由/改写/回答）"]
-    QF["百度千帆 Embedding API\n（向量化/检索向量）"]
+    DS["DeepSeek Chat API\n路由 · 改写 · 回答 · 观测抽取"]
+    QF["百度千帆 Embedding API\nqwen3-embedding-8b"]
+    BaiduLLM["百度大模型 API（可选）\n问题类型辅助判断"]
   end
 
-  LLMRAG --> DS
+  Orchestration --> DS
   Core --> QF
+  RouteLLM -.-> BaiduLLM
 
-  %% ============== Query rewrite & retrieval logic ==============
-  subgraph Logic["查询改写与检索（核心逻辑）"]
-    InQ["用户问句（可能英文/混合）"]
-    Rewrite["one-shot 改写\n输出：中文关键词串（空格分词）\n默认不保留英文 token"]
-    Variants["chapter_rag：生成 2-4 条变体 query（纯字符串）\n主题/科目/学科/题目 等"]
-    Multi["search_multi：逐条检索 top_k_per_query\n合并去重重排"]
+  %% ===================== 进程 B：用户观测 =====================
+  subgraph ProcB["进程 B · 用户观测（user_observer.py）"]
+    Poll["轮询调度\npoll_interval · N 轮阈值"]
+    Worker["UserObserverWorker\nobserver.py"]
+    Extract["StateExtractor\nextractor.py · LLM 增量抽取"]
+    Sanitize["sanitize · schema 校验\n禁止人格化标签"]
+    StarRender["star_map_render · nebula_starmap\n预计算星图进度/亮区"]
+    Poll --> Worker --> Extract --> Sanitize --> StarRender
   end
 
-  InQ --> Rewrite --> Variants --> Multi --> Core
+  subgraph ObsStore["runtime_data/（本地，不提交 Git）"]
+    SQLite[("observation.db\nSQLite WAL\nusers · chat_sessions\nconversation_events\nobservation_states")]
+    ObsCfg["config/observer_config.yaml"]
+  end
 
+  EventW -->|"append-only 每轮事件"| SQLite
+  ProcA -->|"达 N 轮后台线程\n或 POST trigger"| Worker
+  Poll --> Worker
+  SQLite --> Worker
+  StarRender --> SQLite
+  ObsCfg --> Worker
+  Extract --> DS
+  ObsRead --> SQLite
+  HintR --> SQLite
+
+  %% ===================== 星图消费 =====================
+  subgraph StarMap["探索星图"]
+    Catalog["static/data/exploration_star_catalog.json"]
+    Bg["static/images/exploration_nebula_bg.webp"]
+    APIStar["GET /api/observation/catalog\nGET .../starmap"]
+    APIStar --> StarGL
+    Catalog --> APIStar
+    Bg --> StarGL
+    StarRender --> APIStar
+  end
+
+  Client --> APIStar
+
+  %% ===================== 备用入口 =====================
+  subgraph Alt["备用入口"]
+    Streamlit["chat_ui.py · Streamlit\n无观测/星图"]
+  end
+
+  %% ===================== 设计约束 =====================
+  subgraph Constraints["防幻觉 / 设计约束"]
+    C1["引文：quote_validator 校验引号内文字"]
+    C2["无 RAG 时：提示「不知道」；路由失败默认 need_rag=true"]
+    C3["观测 state 不注入回答标签\n仅 retrieval_hints 扩展检索"]
+    C4["元文本/行为类：Reasoner 模型 + 结构化上下文"]
+  end
+
+  QuoteV -.-> C1
+  RouteLLM -.-> C2
+  HintR -.-> C3

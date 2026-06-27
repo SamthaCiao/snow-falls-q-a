@@ -1,0 +1,9 @@
+observer:
+  trigger_every_n_turns: 10
+  trigger_char_threshold: 8000
+  poll_interval_seconds: 15
+  max_turns_per_extract: 20
+  max_llm_calls_per_run: 5
+  use_llm_extractor: true
+  enable_rule_fallback: false
+  visible_summary_max_chars: 600

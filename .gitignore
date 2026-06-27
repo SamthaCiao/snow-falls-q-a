@@ -6,9 +6,17 @@ SUPER_MIND_API_KEY.env
 
 # 数据源目录（不提交；使用 数据源.pack.zip 或本地 数据源/）
 数据源/
+数据源_temp/
+
+# 本地临时/私人笔记
+chatgpt聊天.md
+
 # chroma_db 已允许提交，便于部署时随仓库使用
 # 仅维护者本地保留，clone 者无原文无法重建索引
 rebuild_index.py
+
+# BM25 缓存（本地重建，体积大）
+bm25_*_cache.pkl
 
 # Python
 __pycache__/
@@ -27,7 +35,10 @@ build/
 htmlcov/
 *.log
 
-# IDE
+# 用户观测运行时数据（SQLite、日志；按用户/session 写入，不提交）
+runtime_data/
+
+# IDE / 编辑器
 .idea/
 .vscode/
 *.swp
@@ -36,3 +47,6 @@ htmlcov/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 一次性 smoke 脚本（若本地生成）
+scripts/_smoke_test_*.py

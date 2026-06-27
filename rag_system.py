@@ -1012,19 +1012,33 @@ class NovelRAGSystem:
             'score': score
         }
     
-    def search_timeline(self, query: str, top_k: int = 5) -> List[Dict]:
+    def search_timeline(self, query: str, top_k: int = 5, panoramic: bool = False) -> List[Dict]:
         """
         检索时间线
         
         Args:
             query: 查询文本
-            top_k: 返回top k个结果
+            top_k: 返回top k个结果（panoramic=True 时忽略，返回全部时间点）
+            panoramic: 全景时间线模式，用于「高中三年+大学」等跨阶段问题
         
         Returns:
             时间线检索结果列表
         """
         if not self.timeline_index:
             return []
+
+        if panoramic:
+            return [
+                {
+                    "timepoint": entry["timepoint"],
+                    "events": entry["events"],
+                    "chapters": entry.get("chapters", []),
+                    "content": f"{entry['timepoint']}\n" + "\n".join([f"- {e}" for e in entry["events"]]),
+                    "score": 1.0,
+                    "source": "时间线",
+                }
+                for entry in self.timeline_index
+            ]
         
         results = []
         query_lower = query.lower()

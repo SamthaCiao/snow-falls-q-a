@@ -22,7 +22,7 @@ class StructuredQueryEngine:
         基于JSON结构进行精准查询
         
         Args:
-            index_type: 索引类型 ("timeline", "psychology", "imagery", "meta")
+            index_type: 索引类型 ("timeline", "psychology", "imagery", "meta", "character", "scenario")
             query_terms: 查询词
             knowledge_base: 知识库数据
             max_results: 最大返回结果数
@@ -49,7 +49,15 @@ class StructuredQueryEngine:
             "meta": {
                 "fields": ["theme", "author_intent", "structural_elements"],
                 "query_fn": self.query_meta_analysis
-            }
+            },
+            "character": {
+                "fields": ["心理模型", "key_traits", "key_events"],
+                "query_fn": self.query_character_models
+            },
+            "scenario": {
+                "fields": ["类型", "描述", "示例", "应用方式"],
+                "query_fn": self.query_scenario_rules
+            },
         }
         
         if index_type not in mapping:
@@ -271,6 +279,110 @@ class StructuredQueryEngine:
         
         return unique_items
     
+    def query_character_models(
+        self,
+        query_terms: str,
+        characters: Dict,
+        max_results: int,
+    ) -> List[Dict]:
+        """人物画像/心理模型：按查询词提取相关字段，不全量 dump JSON。"""
+        if not characters:
+            return []
+        query_lower = query_terms.lower()
+        terms = [t for t in re.split(r"\s+", query_lower) if len(t) > 1]
+        results: List[Dict] = []
+
+        for char_name, char_data in characters.items():
+            if not isinstance(char_data, dict):
+                continue
+            score = 0
+            if char_name in query_terms:
+                score += 5
+            for alias in char_data.get("aliases") or []:
+                if alias in query_terms:
+                    score += 3
+
+            psych = char_data.get("心理模型") or {}
+            psych_text = json.dumps(psych, ensure_ascii=False)
+            traits = char_data.get("key_traits") or []
+            events = char_data.get("key_events") or []
+
+            for t in terms:
+                if t in psych_text.lower():
+                    score += 2
+                if any(t in str(x).lower() for x in traits):
+                    score += 1
+
+            matching_events = []
+            for ev in events:
+                ev_text = ev.get("event", ev) if isinstance(ev, dict) else str(ev)
+                if any(t in str(ev_text).lower() for t in terms) or char_name in query_terms:
+                    matching_events.append(ev)
+                    score += 1
+
+            if score <= 0 and char_name not in query_terms:
+                continue
+
+            extracted_psych = {}
+            if isinstance(psych, dict):
+                for k, v in psych.items():
+                    v_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                    if char_name in query_terms or any(t in k.lower() or t in v_str.lower() for t in terms):
+                        extracted_psych[k] = v
+                if not extracted_psych and psych:
+                    for k in ("核心需求", "行为模式", "防御机制", "情感模式"):
+                        if k in psych:
+                            extracted_psych[k] = psych[k]
+
+            results.append({
+                "name": char_name,
+                "role": char_data.get("role", ""),
+                "key_traits": traits[:5],
+                "心理模型": extracted_psych or dict(list(psych.items())[:3]) if isinstance(psych, dict) else psych,
+                "key_events": matching_events[:3] if matching_events else events[:2],
+                "relevance_score": score,
+            })
+
+        results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return results[:max_results]
+
+    def query_scenario_rules(
+        self,
+        query_terms: str,
+        rules_data: Dict,
+        max_results: int,
+    ) -> List[Dict]:
+        """情节推演规则：按查询词匹配相关规则条目。"""
+        if not rules_data:
+            return []
+        rules = rules_data.get("rules") if isinstance(rules_data, dict) else rules_data
+        if not isinstance(rules, list):
+            return []
+
+        results = []
+        query_lower = query_terms.lower()
+        terms = [t for t in re.split(r"\s+", query_lower) if len(t) > 1]
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            blob = json.dumps(rule, ensure_ascii=False).lower()
+            score = sum(1 for t in terms if t in blob)
+            if any(k in query_terms for k in (rule.get("类型") or "", rule.get("描述") or "")):
+                score += 2
+            if score > 0:
+                results.append({
+                    "rule_id": rule.get("rule_id", ""),
+                    "类型": rule.get("类型", ""),
+                    "描述": rule.get("描述", ""),
+                    "示例": rule.get("示例", ""),
+                    "应用方式": rule.get("应用方式", ""),
+                    "relevance_score": score,
+                })
+
+        results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return results[:max_results] if results else rules[:max_results]
+
     def format_results(self, index_type: str, results: List[Dict]) -> str:
         """格式化查询结果"""
         if not results:
@@ -342,5 +454,47 @@ class StructuredQueryEngine:
                 formatted_parts.append(f"{value}")
                 if i < len(results):
                     formatted_parts.append("")
-        
+
+        elif index_type == "character":
+            for i, result in enumerate(results, 1):
+                name = result.get("name", "")
+                role = result.get("role", "")
+                traits = result.get("key_traits") or []
+                psych = result.get("心理模型") or {}
+                events = result.get("key_events") or []
+
+                formatted_parts.append(f"## {name}" + (f"（{role}）" if role else ""))
+                if traits:
+                    formatted_parts.append(f"特质: {', '.join(str(t) for t in traits)}")
+                if psych:
+                    formatted_parts.append("心理模型（摘录）:")
+                    if isinstance(psych, dict):
+                        for k, v in list(psych.items())[:5]:
+                            v_str = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                            if len(v_str) > 300:
+                                v_str = v_str[:300] + "..."
+                            formatted_parts.append(f"  - {k}: {v_str}")
+                    else:
+                        formatted_parts.append(str(psych)[:400])
+                if events:
+                    formatted_parts.append("相关事件:")
+                    for ev in events[:3]:
+                        if isinstance(ev, dict):
+                            formatted_parts.append(f"  - {ev.get('event', ev)}")
+                        else:
+                            formatted_parts.append(f"  - {ev}")
+                if i < len(results):
+                    formatted_parts.append("")
+
+        elif index_type == "scenario":
+            for i, result in enumerate(results, 1):
+                rtype = result.get("类型", "")
+                desc = result.get("描述", "")
+                example = result.get("示例", "")
+                formatted_parts.append(f"【{rtype}】{desc}")
+                if example:
+                    formatted_parts.append(f"  示例: {example}")
+                if i < len(results):
+                    formatted_parts.append("")
+
         return "\n".join(formatted_parts)

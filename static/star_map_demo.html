@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>探索星图 · 演示页</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: "Microsoft YaHei", sans-serif;
+            background: #0a0a0f;
+            color: #ececef;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 0.75rem 1.25rem;
+            border-bottom: 1px solid rgba(120, 180, 255, 0.2);
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        header h1 { font-size: 1.1rem; font-weight: 600; }
+        header p { font-size: 0.85rem; color: #9aa0a6; }
+        main { flex: 1; display: flex; min-height: 0; }
+        .star-map-canvas-wrap {
+            flex: 1;
+            position: relative;
+            min-height: 420px;
+            background-color: #050508;
+            overflow: hidden;
+        }
+        .star-map-bg-dim, .star-map-bg-bright {
+            position: absolute; inset: 0;
+            background-size: cover; background-position: center;
+            pointer-events: none;
+        }
+        .star-map-bg-dim { z-index: 0; filter: brightness(0.12) saturate(0.65); }
+        .star-map-bg-bright {
+            z-index: 1;
+            -webkit-mask-size: 100% 100%; mask-size: 100% 100%;
+            -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+            -webkit-mask-mode: alpha; mask-mode: alpha;
+        }
+        #starMapDemoCanvas {
+            position: relative; z-index: 2;
+            width: 100%; height: 100%; display: block;
+            pointer-events: none; background: transparent;
+        }
+        .star-map-markers {
+            position: absolute; inset: 0; z-index: 3;
+            width: 100%; height: 100%;
+            pointer-events: auto; cursor: default;
+        }
+        .star-map-detail-panel {
+            position: absolute; bottom: 1rem; left: 50%;
+            transform: translateX(-50%) translateY(12px);
+            background: rgba(32, 33, 35, 0.92);
+            border: 1px solid rgba(120, 180, 255, 0.35);
+            border-radius: 0.65rem; padding: 0.65rem 1rem;
+            font-size: 0.875rem; opacity: 0; pointer-events: none;
+            transition: opacity 0.25s, transform 0.25s;
+            text-align: center; z-index: 4;
+        }
+        .star-map-detail-panel.visible {
+            opacity: 1; transform: translateX(-50%) translateY(0);
+        }
+        .star-map-detail-panel strong { display: block; margin-bottom: 0.25rem; }
+        .star-map-detail-panel span { color: #9aa0a6; font-size: 0.8rem; }
+        aside {
+            width: 320px; max-width: 40vw;
+            border-left: 1px solid rgba(120, 180, 255, 0.15);
+            padding: 1rem; overflow-y: auto;
+            font-size: 0.85rem; line-height: 1.55;
+        }
+        aside h2 { font-size: 0.95rem; margin-bottom: 0.75rem; }
+        aside ul { list-style: none; }
+        aside li { margin-bottom: 0.65rem; padding-left: 0.5rem; border-left: 2px solid rgba(120,180,255,0.35); }
+        aside .sub { color: #9aa0a6; font-size: 0.78rem; margin-top: 0.2rem; }
+        aside .hint { color: #7eb8ff; margin-top: 1rem; font-size: 0.8rem; }
+        #demoLegend { color: #b8c4d0; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>探索星图 · 独立演示</h1>
+        <p id="demoLegend">加载中…</p>
+    </header>
+    <main>
+        <div class="star-map-canvas-wrap" id="demoWrap">
+            <canvas id="starMapDemoCanvas"></canvas>
+            <canvas class="star-map-markers" id="starMapMarkers"></canvas>
+            <div class="star-map-detail-panel" id="starMapDetailPanel"></div>
+        </div>
+        <aside id="demoSidebar">
+            <h2>已探索人物 → 事件关系</h2>
+            <ul id="relationList"></ul>
+            <p class="hint">鼠标悬停人物星点：展开关联事件/意象与连线。仅弧段内人物可见，与星云亮起区域一致。</p>
+        </aside>
+    </main>
+    <script src="/static/star_map_gl.js?v=20260626f"></script>
+    <script>
+    (async function () {
+        const legend = document.getElementById('demoLegend');
+        const listEl = document.getElementById('relationList');
+        const canvas = document.getElementById('starMapDemoCanvas');
+
+        async function loadDemoPayload() {
+            const r = await fetch('/static/data/starmap_demo_payload.json');
+            if (!r.ok) throw new Error('请先运行: python scripts/build_starmap_demo.py');
+            return r.json();
+        }
+
+        function buildRelationSidebar(catalog, payload) {
+            const nodes = catalog.nodes || [];
+            const litLabels = new Set((payload.lit_nodes || []).map(n => n.label));
+            listEl.innerHTML = '';
+            litLabels.forEach(label => {
+                const rel = nodes.filter(n => {
+                    if (n.type !== 'event' && n.type !== 'imagery') return false;
+                    const ps = n.parents || (n.parent ? [n.parent] : []);
+                    return ps.includes(label);
+                });
+                const li = document.createElement('li');
+                li.innerHTML = `<strong>${label}</strong>` +
+                    (rel.length
+                        ? `<div class="sub">${rel.slice(0, 6).map(r => {
+                            const ps = r.parents || (r.parent ? [r.parent] : []);
+                            const multi = ps.length > 1 ? `（${ps.join('·')}）` : '';
+                            return r.label + multi;
+                        }).join(' · ')}${rel.length > 6 ? ' …' : ''}</div>`
+                        : '<div class="sub">（无 catalog 关联事件）</div>');
+                listEl.appendChild(li);
+            });
+        }
+
+        try {
+            const [catalogResp, demoPayload] = await Promise.all([
+                fetch('/api/observation/catalog'),
+                loadDemoPayload(),
+            ]);
+            const catalog = catalogResp.ok ? await catalogResp.json() : null;
+            if (!catalog) {
+                const cr = await fetch('/static/data/exploration_star_catalog.json');
+                if (!cr.ok) throw new Error('无法加载 catalog');
+                Object.assign(demoPayload, await cr.json(), demoPayload);
+            }
+            const mapData = await renderStarMap(canvas, demoPayload, '');
+            const pct = Math.round((mapData.progress || 0) * 100);
+            legend.textContent = `已点亮 ${mapData.lit_count || 0} 颗人物 · 探索 ${pct}% · hover 查看事件连线`;
+            buildRelationSidebar(catalog || mapData, mapData);
+        } catch (e) {
+            legend.textContent = '加载失败: ' + e.message;
+            console.error(e);
+        }
+    })();
+    </script>
+</body>
+</html>

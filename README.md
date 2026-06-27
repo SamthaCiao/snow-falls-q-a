@@ -1,99 +1,83 @@
-# 小说RAG系统
+# 雪落回声
 
-基于 LangChain 与百度千帆 API 的小说检索问答系统，专门为《雪落成诗》和《影化成殇》设计。
+基于 LangChain 与 DeepSeek / 千帆 API 的小说检索问答，面向《雪落成诗》与《影化成殇》。Web 端产品名 **雪落回声**；核心是 RAG 问答，并带有异步 **阅读轨迹** 与 **探索星图**（见 [探索星图说明](docs/探索星图说明.md)）。
 
-## 功能特点
+## 功能概览
 
-1. **智能分块**: 分别处理《雪落成诗》和《影化成殇》,不简单合并,确保人名不被切分在块边缘
-2. **三重索引架构**: 语义向量层(ChromaDB) + 关键词索引层(BM25) + 摘要/主题层
-3. **混合检索**: 结合语义向量搜索和BM25关键词搜索,提高检索准确性
-4. **人物系统**: 集成轻量级人物画像系统,自动识别并检索相关人物信息,与RAG检索并行执行
-5. **背景关联**: 分析《影化成殇》时自动结合《雪落成诗》的背景信息,但不输出未直接提及的内容
-6. **行为分析模块**: 统一行为分析模块,支持行为解释类和情节推演类问题,调用人物画像库、时间线索引、元文本知识库、意象系统等数据源
-7. **智能路由**: LLM自动判断问题类型,包括行为解释类、情节推演类、元文本分析类等多种类型
-8. **多跳推理**: 集成ReasoningModule,支持复杂问题的多跳推理和二次检索
-9. **结构化查询**: 使用StructuredQueryEngine精准提取JSON知识库字段,避免全文传递
-10. **高效检索**: 使用向量数据库实现快速检索(目标<10秒)
-11. **对话历史公开（可选）**: 支持将用户对话历史提交到服务端，所有用户、所有设备可见同一份历史列表，无需登录；首次进入网页时可选择「提交到公网」或「仅本地存储（localStorage）」。
-12. **本地运行**: 一次性向量化后,后续检索完全本地运行
-13. **API接口**: 提供FastAPI接口和Swagger UI,方便测试和集成
+- **混合检索**：Chroma 向量 + BM25 + 章节/摘要/时间线等多路检索
+- **人物与行为分析**：人物画像、意象、心理学概念、情节推演规则等结构化库
+- **智能路由**：按问题类型选检索器；复杂问题可走多跳推理
+- **阅读轨迹（用户观测）**：独立进程异步归纳「聊过什么、关注什么」，SQLite 存储，可选 Google 登录
+- **探索星图**：轨迹映射到 ∞ 形星云路径，进度揭示亮区；悬停人物看关联事件
+- **引文校验**：回答中带引号的句子会对照 RAG 原文语料校验，失败则打回重写一次（`ENABLE_QUOTE_VALIDATION`）
+- **本地向量索引**：首次向量化后检索以本地 Chroma 为主（embedding 走千帆 API）
 
-## 更新记录
+更细的操作说明见 [使用说明.md](使用说明.md)；观测与存储见 [用户观测与存储说明](docs/用户观测与存储说明.md)。
 
-### 2026-04-30 更新
+## 近期能力（2026 上）
 
-- **更换 DeepSeek V4 模型**：底层对话模型切换为 DeepSeek V4（以环境变量 `DEEPSEEK_MODEL` 为准）。
-- **中英文/混合问句查询改写兜底（纯字符串，多 query 并行检索）**：面向英文或中英混合输入，增强查询改写与检索兜底，避免把整句（含引号、分号等噪声）直接送入 BM25/jieba 与中文向量检索导致召回下降。
-  - **一次调用完成“翻译 + 改写”**：优先用 one-shot prompt 将英文/混合输入直接改写为“中文关键词串（空格分词）”，失败才回退旧逻辑。
-  - **不生成新的英文 token**：改写结果默认不保留英文；仅当英文在用户原始输入中出现，且能命中续集判定关键词（如 `steven/samantha`）时才允许保留，避免误路由与中文检索噪声。
-  - **人物别名映射**：结合人物画像库做别名→中文主名映射（如 `xiakongshan → 夏空山`）。
-  - **关键词提取兜底（规则）**：模型输出不稳定时，使用规则抽取中文关键词，并进行最终清洗（去引号/分号/标点，输出空格分词）。
-  - **多 query（仍为字符串）并行检索合并**：针对 `chapter_rag` 生成 2-4 条“关键词串变体”（如 `主题/科目/学科/题目`），逐条检索（每条 top_k 更小，如 3），合并去重重排，提高证据句召回稳定性。
-  - **数据源重新打包**：更新 `数据源/system_architecture.mermaid` 并重新生成 `数据源.pack.zip`（无 `数据源/` 目录时启动将自动解压使用）。
+- 用户观测模块：主进程写事件、observer 进程抽取 state，`retrieval_hints` 仅作检索扩展，不往回答里贴标签
+- 探索星图：星云主体底图 + 静态叙事星表 + 按对话点亮；与轨迹共用同一套 session 数据
+- 英文/混合问句：查询改写与多 query 并行检索（2026-04 起，细节见 git 历史）
 
-## 安装
-
-```bash
-# 安装依赖
-pip install -r requirements.txt
-```
-
-## 使用方法
-
-### 1. 安装依赖
+## 安装与启动
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置 API 密钥与数据源（本地开发）
+### 配置
 
-- **密钥**：复制 `.env.example` 为 `.env` 或 `SUPER_MIND_API_KEY.env`，填入 `DEEPSEEK_API_KEY`、`BAIDU_API_KEY` 等（勿提交到 Git）。
-- **数据源**：在项目根目录放置 `数据源/` 目录或 **`数据源.pack.zip`**（zip 二进制，可提交到仓库）；启动时若无 数据源/ 会从 数据源.pack.zip 解压使用。详见 [部署与密钥说明](docs/部署与密钥说明.md)。
+- 复制 `.env.example` 为 `.env` 或 `SUPER_MIND_API_KEY.env`，填入 `DEEPSEEK_API_KEY`、`BAIDU_API_KEY` 等（勿提交 Git）。
+- 数据源：根目录放 `数据源/` 或 **`数据源.pack.zip`**；无目录时启动自动解压。
+- 向量化仅用千帆 API（默认 `qwen3-embedding-8b`），见 [千帆向量文档](https://cloud.baidu.com/doc/qianfan-api/s/Fm7u3ropn)。
 
-**向量化**：本上线版本仅使用**百度千帆 API**（Qwen3-Embedding-8B）。在 `.env` 或 `SUPER_MIND_API_KEY.env` 中设置 `BAIDU_API_KEY`；模型 ID 可通过环境变量 `EMBEDDING_MODEL_BAIDU` 覆盖（默认 `qwen3-embedding-8b`）。API 文档: [千帆-向量](https://cloud.baidu.com/doc/qianfan-api/s/Fm7u3ropn)。
-
-### 3. 启动Web聊天界面（推荐）
-
-**Windows用户**:
-```bash
-run_chat.bat
-```
-
-**Linux/Mac用户**:
-```bash
-python web_chat.py
-```
-
-然后在浏览器中访问: `http://localhost:8000`
-
-### 4. 或启动API服务（备用）
+### 日常开发（两个终端）
 
 ```bash
-python api.py
+# 终端 1
+python web_chat.py          # 或 run_chat.bat
+
+# 终端 2
+python user_observer.py     # 或 run_observer.bat
 ```
 
-服务将在 `http://localhost:8000` 启动，访问 `http://localhost:8000/docs` 查看API文档
+浏览器：`http://localhost:8000`
 
-## API接口说明（备用）
+探索星图、轨迹抽取、API 字段见 [用户观测与存储说明](docs/用户观测与存储说明.md) 与 [探索星图说明](docs/探索星图说明.md)。
 
-#### 回答问题
-- **端点**: `POST /api/answer`
-- **功能**: 根据问题返回答案
-- **参数**:
-  - `question`: 问题文本
-  - `target_source`: 目标来源("雪落成诗"或"影化成殇"),可选
-  - `use_background`: 是否使用背景信息,默认true
-  - `top_k`: 返回top k个结果,默认5
+### 备用入口
 
-#### 检索文档
-- **端点**: `POST /api/search`
-- **功能**: 检索相关文档片段
-- **参数**: 同上
+```bash
+python chat_ui.py           # Streamlit 界面（无观测/星图）
+```
 
-#### 重建索引
-- **端点**: `POST /api/rebuild_index`
-- **功能**: 重新构建向量索引(耗时较长)
+API 文档：启动 `web_chat.py` 后访问 `http://localhost:8000/docs`。
+
+## API 说明
+
+**日常开发以 `web_chat.py` 为准**（`http://localhost:8000/docs`）。主要端点：
+
+| 端点 | 说明 |
+|------|------|
+| `POST /api/chat` | SSE 流式问答（含 RAG 路由、多跳、引文校验） |
+| `POST /api/route-check` | 快速路由预判（元文本等 UI 提示） |
+| `GET/POST /api/shared_history` | 内存共享对话列表（重启清空） |
+| `GET /api/auth/me` | 当前用户（Google 或匿名） |
+| `GET /auth/login` · `/auth/callback` | Google OAuth（可选） |
+| `POST /api/observation/session` | 创建观测 session |
+| `GET /api/observation/{id}` | 阅读轨迹 state |
+| `GET /api/observation/{id}/starmap` | 探索星图 payload |
+| `GET /api/observation/catalog` | 静态星表 + 背景图 URL |
+| `POST /api/observation/trigger` | 手动重抽取轨迹 |
+| `POST /api/observation/correct` | 用户修正可见轨迹文案 |
+| `WebSocket /ws` | 流式（与 `/api/chat` 同能力，含观测写入） |
+
+### 回答校验
+
+- **引文**：带引号句子对照 RAG 原文语料；失败最多打回重写 2 次，仍失败则剥离引号
+- **无引号事实句**：含具体情节/时间/行为的陈述需与检索 context 有关键词重叠；失败打回重写，仍失败则追加核实提示
+- 可通过 `ENABLE_QUOTE_VALIDATION=false` 关闭（不推荐）
 
 ## 编排与可观测性（LangChain 适配）
 
@@ -112,7 +96,7 @@ python api.py
 - **知识库集成**: 集成人物画像库、时间线索引、元文本知识库、意象系统、心理学概念库、情节推演规则等
 - **多跳推理**: ReasoningModule支持复杂问题的多跳推理判断和二次检索
 - **结构化查询**: StructuredQueryEngine精准提取JSON知识库字段,避免全文传递,提高效率
-- **分块策略**: 按章节分割,然后使用递归字符分割器,确保人名完整性
+- **分块策略**: 按章节分割,然后使用递归字符分割器,确保人名完整性（Web 主路径默认 chunk_size=400）
 - **动态摘要**: 支持复杂问题的动态摘要生成(可选功能)
 - **元文本分析**: 专门的元文本分析知识库和检索模块
 - **智能路由**: LLM自动判断问题类型,包括行为解释类、情节推演类、元文本分析类等
@@ -146,9 +130,9 @@ python api.py
 
 ## 公网部署（开放仓库）
 
-- 仓库中**不包含** `.env`、明文 `数据源/` 目录（已写入 `.gitignore`）；可提交 **数据源.pack.zip**、**chroma_db/** 供部署使用，密钥通过 env_vars 注入。
-- 部署前请阅读 [部署与密钥说明](docs/部署与密钥说明.md)，并按平台要求准备 Dockerfile、PORT、单进程等。
-- 根目录已提供 `Dockerfile`、`.env.example`；部署时在平台设置 `env_vars`（如 `DEEPSEEK_API_KEY`、`BAIDU_API_KEY`、`DATA_SOURCE_DIR` 等）。
+- 勿提交 `.env`、`runtime_data/`、明文 `数据源/`；可提交 `数据源.pack.zip`、`chroma_db/`。
+- 根目录有 `Dockerfile`、`.env.example`；密钥走平台环境变量（`DEEPSEEK_API_KEY`、`BAIDU_API_KEY` 等）。
+- **Google OAuth 公网**：设置 `APP_PUBLIC_URL=https://你的后端域名`（与 MCP/平台注入的公网 URL 一致），并在 Google Console 添加 `${APP_PUBLIC_URL}/auth/callback`。
 
 ## 注意事项
 
@@ -161,61 +145,61 @@ python api.py
 
 ## 项目结构
 
-说明：明文 **数据源/** 目录不提交；可提交 **数据源.pack.zip**（zip 二进制）、**chroma_db/** 供部署使用。
+说明：明文 **数据源/** 不提交；可提交 **数据源.pack.zip**、**chroma_db/** 供部署。
 
 ```
 .
-├── 数据源.pack.zip                  # 数据源打包（zip 二进制，可提交；启动时自动解压使用）
-├── chroma_db/                       # 向量与 BM25 缓存（可提交，供部署直接使用）
-├── data_source_loader.py            # 数据源加载：无 数据源/ 时从 数据源.pack.zip 解压
-├── rag_modules/                     # RAG检索模块
-│   ├── base_retriever.py           # 基础检索器
-│   ├── global_summary_retriever.py # 全局摘要检索器
-│   ├── timeline_retriever.py       # 时间线检索器
-│   ├── character_arc_retriever.py  # 人物关系检索器
-│   ├── imagery_retriever.py        # 意象检索器
-│   ├── meta_knowledge_retriever.py # 元文本知识检索器
-│   ├── chapter_rag_retriever.py    # 章节RAG检索器
-│   ├── chapter_summary_retriever.py # 章节摘要检索器
-│   ├── dynamic_summary_generator.py # 动态摘要生成器
-│   ├── behavior_analyzer.py        # 统一行为分析模块
-│   ├── reasoning_module.py         # 多跳推理模块
-│   └── structured_query_engine.py  # 结构化查询引擎
-├── static/                         # 静态文件目录
-│   └── chat.js                     # 前端JavaScript
-├── templates/                      # HTML模板目录
-│   └── chat.html                   # 聊天界面模板
-├── rag_system.py                   # RAG系统核心模块
-├── llm_rag_system.py              # LLM+RAG智能系统
-├── web_chat.py                     # FastAPI Web聊天界面(主要)
-├── chat_ui.py                      # Streamlit聊天界面(备用)
-├── api.py                          # FastAPI API接口(备用)
-├── rebuild_index.py                # 索引重建脚本
-├── requirements.txt                # 依赖列表
-├── README.md                       # 项目说明
-├── 使用说明.md                     # 使用说明文档
-└── 动态摘要测试问题.md             # 动态摘要测试问题列表
+├── web_chat.py / user_observer.py    # 主对话 + 观测（各开一个终端）
+├── auth/                             # Google OAuth（可选）
+├── config/observer_config.yaml       # 观测轮询/阈值
+├── rag_system.py / llm_rag_system.py
+├── rag_modules/                      # 检索、行为分析、推理、引文校验
+├── observation/                      # 观测 DB、抽取、星图 render
+│   ├── star_map.py, star_map_render.py, nebula_starmap.py
+│   └── db.py, extractor.py, observer.py, …
+├── static/
+│   ├── chat.js, star_map_gl.js
+│   ├── star_map_demo.html
+│   ├── data/exploration_star_catalog.json
+│   └── images/exploration_nebula_bg.webp
+├── scripts/
+│   ├── resnap_starmap_paths.py
+│   ├── setup_nebula_starmap.py
+│   └── build_starmap_demo.py
+├── templates/chat.html
+├── docs/
+│   ├── 用户观测与存储说明.md
+│   └── 探索星图说明.md
+├── runtime_data/observation.db       # 本地生成，不提交
+├── chroma_db/
+└── 数据源.pack.zip
 ```
 
 ## 核心文件说明
 
-- **rag_system.py**: RAG系统核心，负责文档加载、分块、向量化、检索
-- **llm_rag_system.py**: LLM+RAG智能系统，负责路由判断、上下文检索、答案生成
-- **web_chat.py**: FastAPI Web聊天界面，提供WebSocket流式输出和元文本分析支持
-- **chat_ui.py**: Streamlit聊天界面，提供交互式聊天体验
-- **api.py**: FastAPI API接口(备用)，提供RESTful API
-- **rag_modules/reasoning_module.py**: 多跳推理模块，使用DeepSeek Reasoner进行推理判断和二次检索
-- **rag_modules/structured_query_engine.py**: 结构化查询引擎，精准提取JSON知识库字段
+- **web_chat.py**：Web 聊天、观测事件写入、星图 API
+- **user_observer.py**：异步抽取阅读轨迹
+- **llm_rag_system.py**：路由、检索编排、生成回答
+- **rag_system.py**：分块、向量化、Chroma 索引
+- **observation/**：SQLite、state 抽取、`retrieval_hints`、星图 render
+- **static/star_map_gl.js**：探索星图前端
+
+详细 API 与字段见 [用户观测与存储说明](docs/用户观测与存储说明.md)。
 
 ## 示例请求
 
 ```python
+import json
 import requests
 
-# 回答问题
-response = requests.post("http://localhost:8000/api/answer", json={
-    "question": "您的问题",
-    "use_background": True
-})
-print(response.json())
+# 主入口：SSE 流式问答（web_chat.py）
+resp = requests.post(
+    "http://localhost:8000/api/chat",
+    json={"message": "夏空山对雪遗诗的态度如何变化？", "session_id": None},
+    headers={"X-Anonymous-User-Id": "your-stable-anon-id"},  # OAuth 启用时建议固定匿名 ID
+    stream=True,
+)
+for line in resp.iter_lines():
+    if line and line.startswith(b"data: "):
+        print(json.loads(line[6:]))
 ```

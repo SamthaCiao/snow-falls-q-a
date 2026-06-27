@@ -10,6 +10,22 @@ logger = logging.getLogger(__name__)
 
 class TimelineRetriever(BaseRetriever):
     """时间线检索器"""
+
+    def _is_panoramic_query(self, query: str) -> bool:
+        """跨多年段/全脉络类问题：需返回完整时间线而非 top_k 截断。"""
+        if not query:
+            return False
+        markers = [
+            "高中三年", "大学阶段", "各发生了", "关键转折", "整个时间",
+            "全时间线", "各阶段", "时间脉络", "发展进程", "从头到尾",
+            "完整时间", "多年", "各时期",
+        ]
+        if any(m in query for m in markers):
+            return True
+        grades = ["高一", "高二", "高三", "大学"]
+        if sum(1 for g in grades if g in query) >= 2:
+            return True
+        return False
     
     def retrieve(self, query: str, top_k: int = 5) -> Dict:
         """
@@ -23,7 +39,11 @@ class TimelineRetriever(BaseRetriever):
             检索结果字典
         """
         logger.info("使用时间线索引...")
-        timeline_results = self.rag_system.search_timeline(query, top_k=top_k)
+        if self._is_panoramic_query(query):
+            timeline_results = self.rag_system.search_timeline(query, top_k=0, panoramic=True)
+            logger.info("[时间线] 全景查询：返回完整时间线索引（非 top_k 截断）")
+        else:
+            timeline_results = self.rag_system.search_timeline(query, top_k=top_k)
         
         if timeline_results:
             context_parts = []

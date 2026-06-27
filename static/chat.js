@@ -13,8 +13,312 @@ let currentConversationId = null; // 当前加载的对话ID
 
 // 历史对话存储键名
 const HISTORY_STORAGE_KEY = 'novel_rag_chat_history';
+const ANON_USER_ID_KEY = 'novel_rag_anon_user_id';
+const OBSERVATION_SESSION_KEY = 'novel_rag_observation_session_id';
+const OBSERVATION_TURN_COUNT_KEY = 'novel_rag_observation_turn_count';
+const OBSERVATION_TRIGGER_EVERY_N = 10;
+
+let observationSessionId = null;
+let observationTurnCount = 0;
+let currentUserProfile = null;
 // API 基地址：同源留空；部署到 GitHub Pages 时在 HTML 中设置 window.__API_BASE__ 为后端地址
 function getApiBase() { return (typeof window !== 'undefined' && window.__API_BASE__) ? window.__API_BASE__.replace(/\/$/, '') : ''; }
+
+function ensureAnonymousUserId() {
+    let id = localStorage.getItem(ANON_USER_ID_KEY);
+    if (!id) {
+        id = `anon_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+        localStorage.setItem(ANON_USER_ID_KEY, id);
+    }
+    return id;
+}
+
+function getAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (!currentUserProfile || !currentUserProfile.authenticated) {
+        headers['X-Anonymous-User-Id'] = ensureAnonymousUserId().replace(/^anon_/, '');
+    }
+    return headers;
+}
+
+function loadObservationSessionFromStorage() {
+    observationSessionId = localStorage.getItem(OBSERVATION_SESSION_KEY);
+    observationTurnCount = parseInt(localStorage.getItem(OBSERVATION_TURN_COUNT_KEY) || '0', 10) || 0;
+}
+
+function persistObservationSession() {
+    if (observationSessionId) {
+        localStorage.setItem(OBSERVATION_SESSION_KEY, observationSessionId);
+    }
+    localStorage.setItem(OBSERVATION_TURN_COUNT_KEY, String(observationTurnCount));
+}
+
+async function ensureObservationSession() {
+    if (observationSessionId) return observationSessionId;
+    try {
+        const resp = await fetch(getApiBase() + '/api/observation/session', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            credentials: 'include',
+            body: JSON.stringify({ conversation_id: currentConversationId || null })
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            observationSessionId = data.session_id;
+            persistObservationSession();
+        }
+    } catch (e) {
+        // 观测会话创建失败不影响主对话
+    }
+    return observationSessionId;
+}
+
+async function refreshAuthProfile() {
+    try {
+        const resp = await fetch(getApiBase() + '/api/auth/me', {
+            credentials: 'include',
+            headers: getAuthHeaders()
+        });
+        if (resp.ok) {
+            currentUserProfile = await resp.json();
+            updateAuthUI();
+        }
+    } catch (e) {
+        currentUserProfile = { authenticated: false, auth_provider: 'anonymous' };
+    }
+}
+
+function updateAuthUI() {
+    const badge = document.getElementById('userBadge');
+    const authBtn = document.getElementById('authButton');
+    if (!badge || !authBtn) return;
+
+    if (currentUserProfile && currentUserProfile.authenticated) {
+        badge.textContent = currentUserProfile.display_name || currentUserProfile.email || '已登录';
+        authBtn.style.display = 'inline-block';
+        authBtn.textContent = '退出';
+        authBtn.onclick = () => {
+            window.location.href = getApiBase() + '/auth/logout';
+        };
+    } else if (currentUserProfile && currentUserProfile.google_oauth_enabled) {
+        badge.textContent = '访客（未登录）';
+        authBtn.style.display = 'inline-block';
+        authBtn.textContent = 'Google 登录';
+        authBtn.onclick = () => {
+            window.location.href = getApiBase() + '/auth/login';
+        };
+    } else {
+        badge.textContent = '本地访客';
+        authBtn.style.display = 'none';
+    }
+}
+
+function toggleTrajectorySidebar() {
+    const sidebar = document.getElementById('trajectorySidebar');
+    if (!sidebar) return;
+    sidebar.classList.toggle('open');
+    if (sidebar.classList.contains('open')) {
+        loadObservationTrajectory();
+    }
+}
+
+function formatTrajectoryUpdatedAt(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function isStaleTrajectoryData(data) {
+    if (!data) return false;
+    const s = data.visible_summary || '';
+    if (/展开了\s*\d+\s*轮|待继续深入|么故事|键节点/.test(s)) return true;
+    const md = data.exploration_coordinates_md || '';
+    if (/第7章沉默|第七集沉默|逃避责任|当时在场其他人|沉默作为逃避|倾向「逃避责任」/.test(md)) return true;
+    return false;
+}
+
+function renderTrajectoryPanel(data) {
+    const container = document.getElementById('trajectoryContent');
+    if (!container) return;
+    if (!data || !data.ready) {
+        container.innerHTML = '<p class="trajectory-empty">尚无阅读轨迹。继续对话，或点击「重新生成轨迹」。</p>';
+        return;
+    }
+    const coordsMd = data.exploration_coordinates_md || '';
+    const staleHint = isStaleTrajectoryData(data)
+        ? '<p class="trajectory-stale">检测到旧版或模板化轨迹，请点击「重新生成轨迹」。</p>'
+        : '';
+    const updatedLabel = formatTrajectoryUpdatedAt(data.updated_at);
+    const footer = updatedLabel
+        ? `<p class="trajectory-empty trajectory-updated">更新 ${escapeHtml(updatedLabel)}</p>`
+        : '';
+    container.innerHTML = `
+        <div class="trajectory-section">
+            <h3>阅读旅程</h3>
+            <p class="trajectory-journey">${escapeHtml(data.visible_summary || '')}</p>
+        </div>
+        <div class="trajectory-section interest-block">
+            <h3>当前探索坐标</h3>
+            ${staleHint}
+            <div class="markdown-body trajectory-md">${renderMarkdown(coordsMd)}</div>
+        </div>
+        ${footer}
+    `;
+}
+
+async function openStarMapFullPage() {
+    await ensureObservationSession();
+    const page = document.getElementById('starMapFullPage');
+    const canvas = document.getElementById('starMapFullCanvas');
+    const legend = document.getElementById('starMapFullLegend');
+    const detail = document.getElementById('starMapDetailPanel');
+    if (!page || !canvas) return;
+    page.classList.add('open');
+    if (legend) legend.textContent = '加载星图…';
+    if (detail) detail.classList.remove('visible');
+    try {
+        if (typeof preloadStarMapCatalog === 'function') {
+            preloadStarMapCatalog(getApiBase()).catch(() => {});
+        }
+        const resp = await fetch(getApiBase() + `/api/observation/${encodeURIComponent(observationSessionId)}/starmap`, {
+            credentials: 'include',
+            headers: getAuthHeaders()
+        });
+        if (!resp.ok) {
+            if (legend) legend.textContent = '星图加载失败';
+            return;
+        }
+        const mapData = await resp.json();
+        if (typeof renderStarMap === 'function') {
+            await renderStarMap(canvas, mapData, getApiBase());
+        }
+        if (legend) {
+            const pct = Math.round((mapData.progress || 0) * 100);
+            legend.textContent = mapData.ready
+                ? `已点亮 ${mapData.lit_count || 0} 颗 · 探索 ${pct}%`
+                : '尚无探索记录，继续对话后重新生成轨迹';
+        }
+    } catch (e) {
+        if (legend) legend.textContent = '星图加载失败';
+    }
+}
+
+function closeStarMapFullPage() {
+    const page = document.getElementById('starMapFullPage');
+    if (page) page.classList.remove('open');
+    if (typeof disposeStarMap === 'function') disposeStarMap();
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text || '';
+    return div.innerHTML;
+}
+
+async function loadObservationTrajectory() {
+    if (!observationSessionId) {
+        renderTrajectoryPanel(null);
+        return;
+    }
+    try {
+        const resp = await fetch(getApiBase() + `/api/observation/${encodeURIComponent(observationSessionId)}`, {
+            credentials: 'include',
+            headers: getAuthHeaders()
+        });
+        if (resp.ok) {
+            renderTrajectoryPanel(await resp.json());
+        }
+    } catch (e) {
+        renderTrajectoryPanel(null);
+    }
+}
+
+async function triggerObservationExtract(showPanel = false) {
+    await ensureObservationSession();
+    if (!observationSessionId) return false;
+    const btn = document.getElementById('regenerateTrajectoryButton');
+    if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+    try {
+        const resp = await fetch(getApiBase() + '/api/observation/trigger', {
+            method: 'POST',
+            credentials: 'include',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ session_id: observationSessionId })
+        });
+        if (resp.ok) {
+            await loadObservationTrajectory();
+            const page = document.getElementById('starMapFullPage');
+            if (page && page.classList.contains('open') && typeof refreshStarMap === 'function') {
+                const mapData = await refreshStarMap(observationSessionId, getApiBase());
+                const legend = document.getElementById('starMapFullLegend');
+                if (legend && mapData) {
+                    const pct = Math.round((mapData.progress || 0) * 100);
+                    legend.textContent = mapData.ready
+                        ? `已点亮 ${mapData.lit_count || 0} 颗 · 探索 ${pct}%`
+                        : '尚无探索记录，继续对话后重新生成轨迹';
+                }
+            }
+            if (showPanel) {
+                const sidebar = document.getElementById('trajectorySidebar');
+                if (sidebar && !sidebar.classList.contains('open')) {
+                    sidebar.classList.add('open');
+                }
+            }
+            const data = await resp.json();
+            return !!(data && data.ready && data.visible_summary);
+        }
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '重新生成轨迹'; }
+    }
+    return false;
+}
+
+async function pollObservationUntilReady(maxAttempts = 15, intervalMs = 2000) {
+    for (let i = 0; i < maxAttempts; i++) {
+        await loadObservationTrajectory();
+        const container = document.getElementById('trajectoryContent');
+        const hasSummary = container && container.textContent && !container.textContent.includes('尚无阅读轨迹');
+        if (hasSummary) {
+            const sidebar = document.getElementById('trajectorySidebar');
+            if (sidebar && !sidebar.classList.contains('open')) {
+                sidebar.classList.add('open');
+            }
+            return true;
+        }
+        await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return false;
+}
+
+async function maybeAutoTriggerObservation() {
+    if (observationTurnCount > 0 && observationTurnCount % OBSERVATION_TRIGGER_EVERY_N === 0) {
+        await triggerObservationExtract(true);
+    }
+}
+
+function onObservationScheduledFromServer(turn) {
+    if (typeof turn === 'number') {
+        observationTurnCount = Math.max(observationTurnCount, turn);
+        persistObservationSession();
+    }
+    pollObservationUntilReady();
+}
+
+function onAssistantTurnComplete(finalData) {
+    if (finalData && finalData.observation_session_id) {
+        observationSessionId = finalData.observation_session_id;
+        persistObservationSession();
+    }
+    if (finalData && typeof finalData.observation_turn === 'number') {
+        observationTurnCount = finalData.observation_turn;
+    } else {
+        observationTurnCount += 1;
+    }
+    persistObservationSession();
+    // 抽取由服务端在 turn=N 时后台触发；前端仅轮询结果（见 observation SSE）
+}
 // 将“会话内容（对话树）”按会话ID单独存储，历史列表仅存元信息，加载更快
 const CONVERSATION_STORAGE_PREFIX = 'novel_rag_conversation_tree_';
 // 服务端共享历史缓存（所有用户可见，不写盘；重启清空）
@@ -562,6 +866,10 @@ function startNewConversation() {
     conversationTree = null;
     currentPathNodeIds = [];
     currentConversationId = null;
+    observationSessionId = null;
+    observationTurnCount = 0;
+    localStorage.removeItem(OBSERVATION_SESSION_KEY);
+    localStorage.removeItem(OBSERVATION_TURN_COUNT_KEY);
     
     // 清空显示
     if (chatContainer) {
@@ -1210,6 +1518,7 @@ async function requestAssistantAnswer(userMessageText, isEditingResend) {
         }
 
         const conversation_history = buildConversationHistoryForBackend(true);
+        await ensureObservationSession();
         
         // 创建assistant节点和消息占位符（用于流式显示）
         const parentId = conversationTree.leafId;
@@ -1222,10 +1531,13 @@ async function requestAssistantAnswer(userMessageText, isEditingResend) {
         // 使用fetch处理流式响应
         const response = await fetch(getApiBase() + '/api/chat', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getAuthHeaders(),
+            credentials: 'include',
             body: JSON.stringify({
                 message: userMessageText,
-                conversation_history
+                conversation_history,
+                session_id: observationSessionId,
+                conversation_id: currentConversationId
             })
         });
 
@@ -1374,6 +1686,8 @@ async function requestAssistantAnswer(userMessageText, isEditingResend) {
                                         }
                                     }
                                 }
+                            } else if (data.type === 'observation') {
+                                onObservationScheduledFromServer(data.turn);
                             } else if (data.type === 'final') {
                                 hasReceivedFinal = true;
                                 // 最终结果
@@ -1619,6 +1933,9 @@ async function requestAssistantAnswer(userMessageText, isEditingResend) {
             addMessage('assistant', `抱歉，处理您的问题时出现错误：${error.message || '未知错误'}。请稍后重试。`, null, false, null, false);
         }
     } finally {
+        if (finalData) {
+            onAssistantTurnComplete(finalData);
+        }
         isProcessing = false;
         if (sendButton) {
             sendButton.disabled = false;
@@ -1743,6 +2060,23 @@ function initializeApp() {
     
     if (newChatButton) {
         newChatButton.addEventListener('click', startNewConversation);
+    }
+
+    const trajectoryButton = document.getElementById('trajectoryButton');
+    const trajectoryCloseButton = document.getElementById('trajectoryCloseButton');
+    const regenerateTrajectoryButton = document.getElementById('regenerateTrajectoryButton');
+    const openStarMapButton = document.getElementById('openStarMapButton');
+    const starMapBackButton = document.getElementById('starMapBackButton');
+    if (trajectoryButton) trajectoryButton.addEventListener('click', toggleTrajectorySidebar);
+    if (trajectoryCloseButton) trajectoryCloseButton.addEventListener('click', toggleTrajectorySidebar);
+    if (regenerateTrajectoryButton) regenerateTrajectoryButton.addEventListener('click', () => triggerObservationExtract(false));
+    if (openStarMapButton) openStarMapButton.addEventListener('click', openStarMapFullPage);
+    if (starMapBackButton) starMapBackButton.addEventListener('click', closeStarMapFullPage);
+
+    loadObservationSessionFromStorage();
+    refreshAuthProfile();
+    if (typeof preloadStarMapCatalog === 'function') {
+        preloadStarMapCatalog(getApiBase()).catch(() => {});
     }
     
     // 启动时默认新对话，不自动加载上次对话

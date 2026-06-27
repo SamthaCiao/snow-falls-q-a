@@ -3,6 +3,8 @@
 SUPER_MIND_API_KEY.env
 数据源
 
+runtime_data
+
 # 测试与缓存
 test
 .pytest_cache

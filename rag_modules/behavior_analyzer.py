@@ -402,29 +402,39 @@ class UnifiedBehaviorAnalyzer(BaseRetriever):
                     context_parts.append("\n【3. 元文本分析库】（作者创作说明）")
                     context_parts.append(meta_result)
         
-        # 4. 人物心理模型（基于文本推断的稳定特征）
-        if question_type == "scenario_simulation":
-            if framework.get("character_states"):
-                context_parts.append("\n【4. 相关人物心理模型】（基于文本推断）")
-                for char_name, char_state in framework["character_states"].items():
-                    context_parts.append(f"\n## {char_name}")
-                    context_parts.append(json.dumps(char_state, ensure_ascii=False, indent=2))
-        else:  # behavior_explanation
-            if framework.get("character_models"):
-                context_parts.append("\n【4. 相关人物心理模型】（基于文本推断）")
-                for char_name, char_model in framework["character_models"].items():
-                    context_parts.append(f"\n## {char_name}")
-                    context_parts.append(json.dumps(char_model, ensure_ascii=False, indent=2))
+        # 4. 人物心理模型（结构化查询，不全量 dump JSON）
+        if question_type == "scenario_simulation" and framework.get("character_states"):
+            char_source = {
+                name: {
+                    "心理模型": st.get("心理模型", {}),
+                    "key_events": st.get("关键事件", st.get("key_events", [])),
+                    "role": st.get("role", ""),
+                }
+                for name, st in framework["character_states"].items()
+            }
+        else:
+            char_source = framework.get("character_models")
+        if char_source:
+            char_result = self.query_engine.query_index(
+                "character", query, char_source, max_results=2
+            )
+            if char_result:
+                context_parts.append("\n【4. 相关人物心理模型】（基于文本推断，结构化摘录）")
+                context_parts.append(char_result)
         
         # 5. 专业分析工具（心理学概念库或情节推演规则）
         if question_type == "scenario_simulation":
             if self.scenario_rules:
-                structured["additional_knowledge"] = {
-                    "type": "scenario_rules",
-                    "content": self.scenario_rules
-                }
-                context_parts.append("\n【5. 情节推演规则】")
-                context_parts.append(json.dumps(self.scenario_rules, ensure_ascii=False, indent=2))
+                scenario_result = self.query_engine.query_index(
+                    "scenario", query, self.scenario_rules, max_results=3
+                )
+                if scenario_result:
+                    structured["additional_knowledge"] = {
+                        "type": "scenario_rules",
+                        "content": scenario_result,
+                    }
+                    context_parts.append("\n【5. 情节推演规则】")
+                    context_parts.append(scenario_result)
             structured["sources"].append({
                 "source": "情节推演规则库",
                 "type": "scenario_rules"

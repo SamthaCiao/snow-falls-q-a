@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>小说RAG智能问答系统</title>
+    <title>雪落回声</title>
     <!-- Markdown渲染库 -->
     <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
     <!-- 代码高亮库（可选，用于代码块） -->
@@ -66,6 +66,334 @@
         
         .history-button:hover {
             background: #565869;
+        }
+
+        .auth-button {
+            background: #19c37d;
+            color: #fff;
+            border: none;
+            border-radius: 0.5rem;
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .auth-button.secondary {
+            background: #40414f;
+        }
+
+        .trajectory-button {
+            background: #5856d6;
+            color: #fff;
+            border: none;
+            border-radius: 0.5rem;
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .trajectory-sidebar {
+            position: fixed;
+            top: 0;
+            left: -480px;
+            width: 480px;
+            height: 100vh;
+            background: #202123;
+            border-right: 1px solid #40414f;
+            transition: left 0.3s ease;
+            z-index: 1001;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .trajectory-sidebar.open {
+            left: 0;
+        }
+
+        .trajectory-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            color: #ececef;
+            line-height: 1.6;
+        }
+
+        .trajectory-section {
+            background: #40414f;
+            border-radius: 0.5rem;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .trajectory-section h3 {
+            font-size: 0.875rem;
+            color: #8e8ea0;
+            margin-bottom: 0.5rem;
+        }
+
+        .trajectory-journey {
+            font-size: 0.9rem;
+            line-height: 1.75;
+            color: #d8d8e0;
+        }
+
+        .trajectory-empty {
+            color: #8e8ea0;
+            font-size: 0.875rem;
+        }
+
+        .trajectory-actions {
+            padding: 1rem;
+            border-top: 1px solid #40414f;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .trajectory-actions button {
+            flex: 1 1 45%;
+            min-width: 120px;
+            padding: 0.6rem;
+            border: none;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+        }
+
+        .interest-block {
+            font-size: 0.875rem;
+            line-height: 1.7;
+        }
+
+        .trajectory-md.markdown-body {
+            font-size: 0.875rem;
+            color: #ececef;
+        }
+
+        .trajectory-md.markdown-body h2 {
+            font-size: 1rem;
+            color: #ececef;
+            margin: 0 0 0.75rem 0;
+            border: none;
+        }
+
+        .trajectory-md.markdown-body ul {
+            margin: 0 0 0.75rem 0;
+            padding-left: 1.1rem;
+        }
+
+        .trajectory-md.markdown-body li {
+            margin-bottom: 0.35rem;
+        }
+
+        .trajectory-md.markdown-body strong {
+            color: #c5c5d2;
+        }
+
+        .trajectory-md.markdown-body blockquote {
+            margin: 0.75rem 0 0 0;
+            padding: 0.5rem 0.75rem;
+            border-left: 3px solid #5856d6;
+            background: rgba(88, 86, 214, 0.12);
+            color: #d4d4e8;
+            border-radius: 0 0.35rem 0.35rem 0;
+        }
+
+        .trajectory-stale {
+            color: #ffb347;
+            font-size: 0.8rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .trajectory-updated {
+            margin-top: 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .star-map-section canvas {
+            width: 100%;
+            height: 300px;
+            border-radius: 0.5rem;
+            display: block;
+            background: #050510;
+        }
+
+        .star-map-legend {
+            font-size: 0.75rem;
+            color: #8e8ea0;
+            margin-top: 0.35rem;
+        }
+
+        /* 全屏探索星图（保留顶栏） */
+        .star-map-fullpage {
+            position: fixed;
+            top: 72px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 1000;
+            background: #000;
+            display: none;
+            flex-direction: column;
+        }
+
+        .star-map-fullpage.open {
+            display: flex;
+        }
+
+        .star-map-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.65rem 1rem;
+            background: rgba(32, 33, 35, 0.92);
+            border-bottom: 1px solid #40414f;
+            flex-shrink: 0;
+        }
+
+        .star-map-back-btn {
+            background: #40414f;
+            color: #ececef;
+            border: none;
+            border-radius: 0.5rem;
+            padding: 0.45rem 0.85rem;
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .star-map-back-btn:hover {
+            background: #565869;
+        }
+
+        .star-map-toolbar-title {
+            font-size: 0.95rem;
+            color: #ececef;
+            font-weight: 600;
+        }
+
+        .star-map-full-legend {
+            margin-left: auto;
+            font-size: 0.75rem;
+            color: #8e8ea0;
+        }
+
+        .star-map-canvas-wrap {
+            flex: 1;
+            position: relative;
+            min-height: 0;
+            background-color: #050508;
+            overflow: hidden;
+        }
+
+        .star-map-bg-dim,
+        .star-map-bg-bright {
+            position: absolute;
+            inset: 0;
+            background-size: cover;
+            background-position: center;
+            pointer-events: none;
+        }
+
+        .star-map-bg-dim {
+            z-index: 0;
+            filter: brightness(0.12) saturate(0.65);
+        }
+
+        .star-map-bg-bright {
+            z-index: 1;
+            -webkit-mask-size: 100% 100%;
+            mask-size: 100% 100%;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-mode: alpha;
+            mask-mode: alpha;
+            -webkit-mask-position: center;
+            mask-position: center;
+        }
+
+        #starMapFullCanvas {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            height: 100%;
+            display: block;
+            cursor: default;
+            background: transparent;
+            pointer-events: none;
+        }
+
+        .star-map-markers {
+            position: absolute;
+            inset: 0;
+            z-index: 3;
+            width: 100%;
+            height: 100%;
+            pointer-events: auto;
+            cursor: default;
+        }
+
+        .star-map-detail-panel {
+            position: absolute;
+            bottom: 1rem;
+            left: 50%;
+            transform: translateX(-50%) translateY(12px);
+            background: rgba(32, 33, 35, 0.92);
+            border: 1px solid rgba(120, 180, 255, 0.35);
+            border-radius: 0.65rem;
+            padding: 0.65rem 1rem;
+            color: #ececef;
+            font-size: 0.875rem;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s, transform 0.25s;
+            text-align: center;
+            z-index: 4;
+        }
+
+        .star-map-detail-panel.visible {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .star-map-detail-panel span {
+            display: block;
+            font-size: 0.75rem;
+            color: #8e8ea0;
+            margin-top: 0.2rem;
+        }
+
+        .interest-block .label {
+            color: #8e8ea0;
+            min-width: 4.5em;
+            display: inline-block;
+        }
+
+        .interest-block .value {
+            color: #ececef;
+        }
+
+        #starMapCanvas {
+            width: 100%;
+            height: 280px;
+            background: radial-gradient(ellipse at center, #1a1b2e 0%, #0d0e14 70%);
+            border-radius: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .star-map-legend {
+            font-size: 0.75rem;
+            color: #8e8ea0;
+            margin-top: 0.35rem;
+            text-align: center;
+        }
+
+        .user-badge {
+            font-size: 0.75rem;
+            color: #8e8ea0;
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         
         .history-sidebar {
@@ -1180,11 +1508,43 @@
     
     <div class="header">
         <div>
-            <h1>📚 小说RAG智能问答系统</h1>
-            <span class="subtitle">基于LLM+RAG | 支持《雪落成诗》和《影化成殇》</span>
+            <h1>雪落回声</h1>
+            <span class="subtitle">基于《雪落成诗》和《影化成殇》的探索式阅读问答工具</span>
         </div>
         <div class="header-actions">
+            <span class="user-badge" id="userBadge">访客</span>
+            <button class="trajectory-button" id="trajectoryButton" title="查看阅读轨迹">🧭 阅读轨迹</button>
+            <button class="auth-button secondary" id="authButton" style="display:none;">登录</button>
             <button class="history-button" id="historyButton">📜 历史对话</button>
+        </div>
+    </div>
+
+    <!-- 阅读轨迹侧边栏 -->
+    <div class="trajectory-sidebar" id="trajectorySidebar">
+        <div class="history-header">
+            <h2>阅读轨迹</h2>
+            <button class="close-button" id="trajectoryCloseButton">×</button>
+        </div>
+        <div class="trajectory-content" id="trajectoryContent">
+            <p class="trajectory-empty">开始对话后，系统会异步记录你的探索状态。每 10 轮左右更新一次。</p>
+        </div>
+        <div class="trajectory-actions">
+            <button id="regenerateTrajectoryButton" style="background:#565869;color:#fff;">重新生成轨迹</button>
+            <button id="openStarMapButton" style="background:#5856d6;color:#fff;">查看我的探索轨迹星图</button>
+        </div>
+    </div>
+
+    <!-- 全屏探索星图（保留顶栏） -->
+    <div class="star-map-fullpage" id="starMapFullPage">
+        <div class="star-map-toolbar">
+            <button class="star-map-back-btn" id="starMapBackButton">← 返回对话</button>
+            <span class="star-map-toolbar-title">🌌 探索轨迹星图</span>
+            <span class="star-map-full-legend" id="starMapFullLegend">加载中…</span>
+        </div>
+        <div class="star-map-canvas-wrap">
+            <canvas id="starMapFullCanvas"></canvas>
+            <canvas class="star-map-markers" id="starMapMarkers"></canvas>
+            <div class="star-map-detail-panel" id="starMapDetailPanel"></div>
         </div>
     </div>
     
@@ -1228,7 +1588,8 @@
     
     <!-- 部署到 GitHub Pages 时改为后端 API 地址，例如：window.__API_BASE__ = 'https://your-backend.example.com'; -->
     <script>window.__API_BASE__ = window.__API_BASE__ || '';</script>
-    <script src="/static/chat.js"></script>
+    <script src="/static/star_map_gl.js?v=20260627d"></script>
+    <script src="/static/chat.js?v=20260627d"></script>
 </body>
 </html>
 
