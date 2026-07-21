@@ -1,3 +1,15 @@
+---
+title: 雪落回声
+emoji: ❄️
+colorFrom: blue
+colorTo: gray
+sdk: docker
+app_port: 8000
+pinned: false
+short_description: 小说 RAG 问答（雪落成诗 / 影化成殇）
+startup_duration_timeout: 10m
+---
+
 # 雪落回声
 
 基于 LangChain 与 DeepSeek / 千帆 API 的小说检索问答，面向《雪落成诗》与《影化成殇》。Web 端产品名 **雪落回声**；核心是 RAG 问答，并带有异步 **阅读轨迹** 与 **探索星图**（见 [探索星图说明](docs/探索星图说明.md)）。
@@ -132,7 +144,8 @@ API 文档：启动 `web_chat.py` 后访问 `http://localhost:8000/docs`。
 
 - 勿提交 `.env`、`runtime_data/`、明文 `数据源/`；可提交 `数据源.pack.zip`、`chroma_db/`。
 - 根目录有 `Dockerfile`、`.env.example`；密钥走平台环境变量（`DEEPSEEK_API_KEY`、`BAIDU_API_KEY` 等）。
-- **Google OAuth 公网**：设置 `APP_PUBLIC_URL=https://你的后端域名`（与 MCP/平台注入的公网 URL 一致），并在 Google Console 添加 `${APP_PUBLIC_URL}/auth/callback`。
+- **Google OAuth 公网**：每个托管平台各自设置 `APP_PUBLIC_URL`（本平台根 URL），并在 Google Console 为每个域名添加 `${APP_PUBLIC_URL}/auth/callback`（可多条并存）。
+- **Hugging Face Spaces（Docker）**：本 README 顶部 YAML 已声明 `sdk: docker`、`app_port: 8000`；在 Space Settings → Secrets 注入密钥后构建即可。
 
 ## 注意事项
 
