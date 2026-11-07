@@ -167,8 +167,12 @@ class LLMRAGSystem:
         step_start = time.time()
         logger.info("[步骤6/7] 正在检查百度大模型API配置...")
         self.baidu_api_key = os.getenv('BAIDU_API_KEY')
+        # ERNIE-3.5-8K 已退役。千帆模型列表（2026-11-03）里仍在运营的文心旗舰接入点是 ernie-5.1。
+        # https://cloud.baidu.com/doc/qianfan/s/rmh4stp0j
+        # https://cloud.baidu.com/doc/qianfan-api/s/3m7of64lb
+        self.qianfan_router_model = os.getenv('QIANFAN_ROUTER_MODEL', 'ernie-5.1')
         if self.baidu_api_key:
-            logger.info("        ✓ 百度大模型API已配置，将用于问题类型判断")
+            logger.info(f"        ✓ 百度千帆已配置，问题分类路由使用 {self.qianfan_router_model}")
         else:
             logger.warning("        ⚠ 未配置百度大模型API，将使用DeepSeek进行问题类型判断")
         step_time = time.time() - step_start
@@ -450,6 +454,44 @@ class LLMRAGSystem:
             return "imagery"  # 使用意象系统索引
         else:
             return "chapter_rag"  # 使用现有RAG
+
+    def _qianfan_router_complete(self, messages: List[Dict]) -> str:
+        """千帆 v2 文本生成，供问题分类路由使用。"""
+        response = requests.post(
+            "https://qianfan.baidubce.com/v2/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.baidu_api_key}",
+            },
+            json={
+                "model": self.qianfan_router_model,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": 512,
+                "thinking": {"type": "disabled"},
+                "response_format": {"type": "json_object"},
+            },
+            timeout=20,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+        result = response.json()
+        if "error" in result:
+            error_msg = result.get("error", {}).get("message", "")
+            raise RuntimeError(f"百度API错误: {error_msg}")
+        choices = result.get("choices") or []
+        if not choices:
+            raise RuntimeError("百度API响应格式异常")
+        return (choices[0].get("message") or {}).get("content") or ""
+
+    @staticmethod
+    def _loads_json_object(content: str) -> Dict:
+        content_clean = (content or "").strip()
+        if content_clean.startswith("```json"):
+            content_clean = content_clean.replace("```json", "").replace("```", "").strip()
+        elif content_clean.startswith("```"):
+            content_clean = content_clean.replace("```", "").strip()
+        return json.loads(content_clean)
     
     def _classify_question_type(self, user_query: str) -> Tuple[str, str]:
         """
@@ -478,15 +520,8 @@ class LLMRAGSystem:
             }
             return question_type, f"关键词匹配：{type_names.get(question_type, '章节RAG检索')}"
         
-        # 使用百度大模型进行更精确的判断
+        # 使用百度千帆进行更精确的判断
         try:
-            # 百度千帆API调用（新格式）
-            url = "https://qianfan.baidubce.com/v2/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.baidu_api_key}"
-            }
-            
             prompt = f"""请判断以下问题属于哪种类型，选择最合适的索引策略：
 
 问题：{user_query}
@@ -518,67 +553,22 @@ class LLMRAGSystem:
 
 只返回JSON格式：{{"type": "global_summary" | "timeline_db" | "character_arc" | "imagery" | "meta_analysis" | "behavior_explanation" | "scenario_simulation" | "chapter_rag", "reason": "判断理由"}}"""
 
-            payload = {
-                "model": "ernie-3.5-8k",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.1
-            }
-            
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                # 检查是否有错误
-                if 'error' in result:
-                    error_code = result.get('error', {}).get('code', '')
-                    error_msg = result.get('error', {}).get('message', '')
-                    logger.warning(f"百度API返回错误: code={error_code}, message={error_msg}")
-                    raise Exception(f"百度API错误: {error_msg}")
-                
-                # 新格式的响应中，内容在 choices[0].message.content
-                if 'choices' in result and len(result['choices']) > 0:
-                    content = result['choices'][0]['message']['content']
-                    
-                    # 处理可能被包裹在代码块中的JSON
-                    content_clean = content.strip()
-                    if content_clean.startswith('```json'):
-                        # 移除 ```json 和 ``` 标记
-                        content_clean = content_clean.replace('```json', '').replace('```', '').strip()
-                    elif content_clean.startswith('```'):
-                        # 移除通用的 ``` 标记
-                        content_clean = content_clean.replace('```', '').strip()
-                    
-                    try:
-                        # 尝试解析JSON
-                        parsed = json.loads(content_clean)
-                        q_type = parsed.get("type", question_type)  # 如果解析失败，使用关键词判断结果
-                        reason = parsed.get("reason", "")
-                        
-                        # 验证类型是否有效
-                        valid_types = ["global_summary", "timeline_db", "character_arc", "imagery", "meta_analysis", "behavior_explanation", "scenario_simulation", "chapter_rag"]
-                        if q_type not in valid_types:
-                            q_type = question_type  # 使用关键词判断结果
-                    except json.JSONDecodeError:
-                        # 如果JSON解析失败，使用关键词判断结果
-                        q_type = question_type
-                        reason = "JSON解析失败，使用关键词判断"
-                    
-                    logger.info(f"问题类型判断: {q_type} - {reason}")
-                    return q_type, reason
-                else:
-                    logger.warning(f"百度API响应中未找到choices字段: {result}")
-                    raise Exception("百度API响应格式异常")
-            else:
-                logger.warning(f"百度API调用失败，状态码: {response.status_code}, 响应: {response.text}")
-                raise Exception(f"HTTP {response.status_code}")
+            content = self._qianfan_router_complete([
+                {"role": "user", "content": prompt}
+            ])
+            try:
+                parsed = self._loads_json_object(content)
+                q_type = parsed.get("type", question_type)
+                reason = parsed.get("reason", "")
+                valid_types = ["global_summary", "timeline_db", "character_arc", "imagery", "meta_analysis", "behavior_explanation", "scenario_simulation", "chapter_rag"]
+                if q_type not in valid_types:
+                    q_type = question_type
+            except json.JSONDecodeError:
+                q_type = question_type
+                reason = "JSON解析失败，使用关键词判断"
+
+            logger.info(f"问题类型判断: {q_type} - {reason} (model={self.qianfan_router_model})")
+            return q_type, reason
                 
         except Exception as e:
             logger.error(f"问题类型判断失败: {e}，使用关键词判断")
@@ -1595,17 +1585,24 @@ class LLMRAGSystem:
 只返回JSON格式：{"need_rag": true/false, "question_type": "类型", "type_reason": "类型判断理由", "rag_reason": "RAG判断理由"}"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            if self.baidu_api_key:
+                content = self._qianfan_router_complete([
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"用户问题：{user_query}\n\n请同时判断是否需要RAG和问题类型。"}
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"}
-            )
-            
-            result = json.loads(response.choices[0].message.content)
+                    {"role": "user", "content": f"用户问题：{user_query}\n\n请同时判断是否需要RAG和问题类型。"},
+                ])
+                result = self._loads_json_object(content)
+                logger.info(f"问题分类路由: qianfan/{self.qianfan_router_model}")
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"用户问题：{user_query}\n\n请同时判断是否需要RAG和问题类型。"}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
+                )
+                result = json.loads(response.choices[0].message.content)
             need_rag = result.get("need_rag", True)  # 默认需要RAG（更安全）
             question_type = result.get("question_type", quick_type)  # 如果解析失败，使用关键词判断
             type_reason = result.get("type_reason", "LLM判断")
