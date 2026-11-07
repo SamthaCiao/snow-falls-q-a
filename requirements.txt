@@ -1,6 +1,9 @@
 # 核心 RAG（向量化使用千帆 API，无本地 embedding）
-chromadb>=0.4.0
-numpy>=1.20.0
+# chromadb 1.5.9 有 cp39-abi3 manylinux 轮子。现有 chroma_db 是 1.x 库，1.5.9 已打开副本：主集 244、续集 69。
+chromadb==1.5.9
+# 1.31.1 是 Python 3.11 / manylinux_2_28 上有轮子的最新版，避免构建机去编译更新的源码包。
+onnxruntime==1.31.1
+numpy>=1.22.5
 
 # 可选：BM25、中文分词
 rank-bm25>=0.2.2

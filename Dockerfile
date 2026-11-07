@@ -6,14 +6,18 @@ FROM python:3.11-slim
 RUN useradd -m -u 1000 user
 
 ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
+    PATH=/home/user/.local/bin:$PATH \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=180 \
+    PIP_PREFER_BINARY=1
 
 WORKDIR $HOME/app
 
 COPY --chown=user:user requirements.txt .
 USER user
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# 非 root 必须装进用户目录；--prefer-binary 优先轮子，避免 chromadb / onnxruntime 走源码编译。
+RUN python -m pip install --no-cache-dir --user --upgrade pip \
+    && python -m pip install --no-cache-dir --user --prefer-binary -r requirements.txt
 
 COPY --chown=user:user . .
 RUN mkdir -p runtime_data
