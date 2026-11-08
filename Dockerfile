@@ -9,7 +9,9 @@ ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=180 \
-    PIP_PREFER_BINARY=1
+    PIP_PREFER_BINARY=1 \
+    PIP_QUIET=1 \
+    PIP_PROGRESS_BAR=off
 
 WORKDIR $HOME/app
 
@@ -17,8 +19,9 @@ COPY --chown=user:user requirements-deploy.lock .
 USER user
 # 非 root 装进用户目录。锁文件把传递依赖钉死，合计必须小于 256 MiB。
 # 推送前运行 python scripts/check_deploy_budget.py。
-RUN python -m pip install --no-cache-dir --user --upgrade pip \
-    && python -m pip install --no-cache-dir --user --prefer-binary -r requirements-deploy.lock
+# 平台构建日志只返回约 20KB。静默安装去掉 Collecting 行，并把 pip 的 stderr 并进 stdout，失败信息才不会被进度刷掉。
+RUN python -m pip install --no-cache-dir --user --quiet --progress-bar off --upgrade pip 2>&1 \
+    && python -m pip install --no-cache-dir --user --quiet --progress-bar off --prefer-binary -r requirements-deploy.lock 2>&1
 
 COPY --chown=user:user . .
 RUN mkdir -p runtime_data
