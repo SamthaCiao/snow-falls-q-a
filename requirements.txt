@@ -1,8 +1,10 @@
-# 核心 RAG（向量化使用千帆 API，无本地 embedding）
+# 本地开发依赖。部署不装本文件，只装 requirements-deploy.lock。
+# 硬约束：锁里的直接依赖和传递依赖合计必须小于 256 MiB。
+# 改版本后运行 python scripts/check_deploy_budget.py，通过后再构建。
 # chromadb 1.5.9 有 cp39-abi3 manylinux 轮子。现有 chroma_db 是 1.x 库，1.5.9 已打开副本：主集 244、续集 69。
 chromadb==1.5.9
-# 1.31.1 是 Python 3.11 / manylinux_2_28 上有轮子的最新版，避免构建机去编译更新的源码包。
-onnxruntime==1.31.1
+# 部署锁钉在 1.16.3（manylinux2014，约 6 MiB）。1.31.1 只有更大的 manylinux_2_28 轮子。
+onnxruntime>=1.14.1
 numpy>=1.22.5
 
 # 可选：BM25、中文分词

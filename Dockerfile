@@ -13,11 +13,12 @@ ENV HOME=/home/user \
 
 WORKDIR $HOME/app
 
-COPY --chown=user:user requirements.txt .
+COPY --chown=user:user requirements-deploy.lock .
 USER user
-# 非 root 必须装进用户目录；--prefer-binary 优先轮子，避免 chromadb / onnxruntime 走源码编译。
+# 非 root 装进用户目录。锁文件把传递依赖钉死，合计必须小于 256 MiB。
+# 推送前运行 python scripts/check_deploy_budget.py。
 RUN python -m pip install --no-cache-dir --user --upgrade pip \
-    && python -m pip install --no-cache-dir --user --prefer-binary -r requirements.txt
+    && python -m pip install --no-cache-dir --user --prefer-binary -r requirements-deploy.lock
 
 COPY --chown=user:user . .
 RUN mkdir -p runtime_data
