@@ -14,6 +14,7 @@ ENV HOME=/home/user \
     PIP_PROGRESS_BAR=off
 
 WORKDIR $HOME/app
+RUN mkdir -p runtime_data && chown -R user:user $HOME/app
 
 COPY --chown=user:user requirements-deploy.lock .
 USER user
@@ -24,7 +25,6 @@ RUN python -m pip install --no-cache-dir --user --quiet --progress-bar off --upg
     && python -m pip install --no-cache-dir --user --quiet --progress-bar off --prefer-binary -r requirements-deploy.lock 2>&1
 
 COPY --chown=user:user . .
-RUN mkdir -p runtime_data
 
 # 平台注入 PORT；HF README app_port=8000；默认 8000
 EXPOSE 8000
